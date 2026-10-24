@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  导出诊断日志用的 FileProvider。
+
+  不配它就没法把 App 私有目录里的日志分享出去（系统会拒绝跨应用传 file:// URI，
+  Android 7+ 直接抛 FileUriExposedException）。scope 只开放 cache/logs 一个目录。
+-->
+<paths>
+    <cache-path name="diag_logs" path="logs/" />
+</paths>

@@ -1,0 +1,7 @@
+package com.kmusic.apkhd.crypto
+
+/** 由 Python 参考实现推导的中间值（用于交叉验证） */
+object QmcEkeyTestHelper {
+    /** kwDES 解 ekey 去掉 user 前缀后得到的 QMC ekey */
+    const val qmcEkey = "MHJXOThJNWT0nNMBv31sEytYP8gQBbTTAVdGYNLUDC7WDLHJoDHFgeN/H8o7iJztH9T9FcSAKpfMPBgzsq4rtfvhzp+ILQEhj3V8sEwAZZtA56rq8/C5OfrH6w+9ODdC+ciHV9uOkxzd/BXvq2pNFxLo/WBlQB3qryEC5NwxwJ4QlqzDwWiQWLFIqPH38/bWEgquZk9wPTvAajXpUcDj1hXnmnxanV8t3YTqeZyAswIn7q1Rii8TJ54D5c2SgMG4vt5Pwb5XAjQgAnzcowoL6Pxus+4iPoaSlhvAwPMNOc8/OchFfQD4rREKGVAtDT/9sC0bZsxL8zqeynOcvAFZBw0C7DXHIyL3PUHXxXecShh79cHajhdDxNtVk9g5+kMohHg05OC8DimzhI6Lvrc8lBFiHDyGzz6Wd0xGSes522OzuxOeOkokyy+hx5LN34koqDObjzAEguj6B+u/365Z8e2+Lul2vKOEMJO3iY0Us/oXwzk9GhsWoqh9k8hao8SFSqw4CzK8tiFjulClUmmLFoKFVq6BFWTTRseHbyeFwn3SWwXuJTih1vQWh/NbJnjBoCX0nTOjsy+jIDMHG1MUFL/Cm1YHZkJTRDaVPLaSVgQJeM+8s6/TA1qw4eXD+mhY7xYUnNqBe7TgTQNTf2QHWb80v6wPb2vFMMwF1QOQB2tY8FTWXwwyMU1izhTQwPhA"
+}

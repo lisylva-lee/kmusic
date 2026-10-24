@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<style>
+ html,body{margin:0;padding:0;background:transparent;}
+ .stage{display:block;}
+ /* 棋盘底：用于确认前景层的透明区真的是透明的 */
+ .checker{background-image:
+   linear-gradient(45deg,#888 25%,transparent 25%),
+   linear-gradient(-45deg,#888 25%,transparent 25%),
+   linear-gradient(45deg,transparent 75%,#888 75%),
+   linear-gradient(-45deg,transparent 75%,#888 75%);
+  background-size:36px 36px;
+  background-position:0 0,0 18px,18px -18px,-18px 0;}
+</style></head><body>
+<svg width="0" height="0" style="position:absolute"><defs>
+
+ <radialGradient id="g_bg_violet" cx="46%" cy="30%" r="86%">
+  <stop offset="0%"   stop-color="#4A3277"/>
+  <stop offset="50%"  stop-color="#1B1733"/>
+  <stop offset="100%" stop-color="#0A0810"/>
+ </radialGradient>
+
+ <linearGradient id="g_chrome_v" x1="0%" y1="0%" x2="100%" y2="100%">
+  <stop offset="0%"   stop-color="#F4F7FF"/>
+  <stop offset="26%"  stop-color="#9FAAC9"/>
+  <stop offset="50%"  stop-color="#4A5273"/>
+  <stop offset="72%"  stop-color="#DCE4F8"/>
+  <stop offset="100%" stop-color="#69739A"/>
+ </linearGradient>
+
+ <filter id="f_glow" x="-70%" y="-70%" width="240%" height="240%">
+  <feGaussianBlur stdDeviation="3.4" result="b1"/>
+  <feGaussianBlur in="SourceGraphic" stdDeviation="7" result="b2"/>
+  <feMerge><feMergeNode in="b2"/><feMergeNode in="b1"/>
+           <feMergeNode in="b1"/><feMergeNode in="SourceGraphic"/></feMerge>
+ </filter>
+
+ <!-- 真镜面光照：从模糊 alpha 推法线打出边缘高光 -->
+ <filter id="f_metal" x="-45%" y="-45%" width="190%" height="190%">
+  <feGaussianBlur in="SourceAlpha" stdDeviation="4.6" result="bump"/>
+  <feSpecularLighting in="bump" surfaceScale="7" specularConstant="1.15"
+                      specularExponent="22" lighting-color="#ffffff" result="spec">
+   <fePointLight x="22" y="8" z="150"/>
+  </feSpecularLighting>
+  <feComposite in="spec" in2="SourceAlpha" operator="in" result="specClip"/>
+  <feMerge><feMergeNode in="SourceGraphic"/><feMergeNode in="specClip"/></feMerge>
+ </filter>
+
+ <!-- 声波柱本体（前景层内容，不含底色） -->
+ <g id="bars">
+  <g fill="#6E6BF0" opacity="0.55" filter="url(#f_glow)">
+   <rect x="23"   y="43" width="7" height="22" rx="3.5"/>
+   <rect x="35"   y="37" width="7" height="34" rx="3.5"/>
+   <rect x="47"   y="29" width="7" height="50" rx="3.5"/>
+   <rect x="59"   y="35" width="7" height="38" rx="3.5"/>
+   <rect x="71"   y="41" width="7" height="26" rx="3.5"/>
+  </g>
+  <g fill="url(#g_chrome_v)" filter="url(#f_metal)">
+   <rect x="26.5" y="45" width="7" height="18" rx="3.5"/>
+   <rect x="38.5" y="39" width="7" height="30" rx="3.5"/>
+   <rect x="50.5" y="31" width="7" height="46" rx="3.5"/>
+   <rect x="62.5" y="37" width="7" height="34" rx="3.5"/>
+   <rect x="74.5" y="43" width="7" height="22" rx="3.5"/>
+  </g>
+ </g>
+
+</defs></svg>
+
+<!-- 自适应图标：背景层（不透明、铺满 108） -->
+<svg id="bg" class="stage" width="432" height="432" viewBox="0 0 108 108">
+  <rect width="108" height="108" fill="url(#g_bg_violet)"/>
+</svg>
+
+<!-- 自适应图标：前景层（透明底，内容收在中央安全区） -->
+<svg id="fg" class="stage" width="432" height="432" viewBox="0 0 108 108">
+  <use href="#bars"/>
+</svg>
+
+<!-- 仅用于我自己目视检查透明区 -->
+<svg id="fgprev" class="stage checker" width="432" height="432" viewBox="0 0 108 108"><use href="#bars"/></svg>
+
+<!-- 合成整图 -->
+<svg id="full" class="stage" width="432" height="432" viewBox="0 0 108 108">
+  <rect width="108" height="108" fill="url(#g_bg_violet)"/>
+  <use href="#bars"/>
+</svg>
+
+<!-- 商店用 512 -->
+<svg id="store" class="stage" width="512" height="512" viewBox="0 0 108 108">
+  <rect width="108" height="108" fill="url(#g_bg_violet)"/>
+  <use href="#bars"/>
+</svg>
+
+</body></html>

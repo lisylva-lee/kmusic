@@ -1,0 +1,29 @@
+build/
+.gradle/
+.kotlin/
+local.properties
+*.iml
+.idea/
+dist/
+docs-*.png
+.tmp-*.xml
+
+# 日志与临时产物
+*.log
+
+# 签名材料：绝不入库
+*.jks
+*.keystore
+*.p12
+*.pfx
+
+# 发布物
+*.apk
+*.aab
+
+# 本仓库不包含任何项目记忆/笔记
+memory/
+MEMORY.md
+
+# 作者本机的签名说明（含口令），不上传
+SIGNING.md

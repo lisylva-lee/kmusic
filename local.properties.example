@@ -1,0 +1,13 @@
+# 复制成 local.properties 后按需填写。local.properties 已在 .gitignore 里，不会入库。
+#
+# Android SDK 路径（用 Android Studio 打开会自动生成）
+sdk.dir=/path/to/Android/Sdk
+
+# ---------- 正式签名凭证（可选）----------
+# 不填也能编译，会使用默认调试签名。但调试签名的包无法覆盖安装你自己发布的正式版。
+# 要用自己的签名发布，在 local.properties 里补上这四项即可，KMUSIC_STORE_FILE 是
+# 相对工程根目录的路径。
+KMUSIC_STORE_FILE=release.keystore
+KMUSIC_STORE_PASSWORD=your_store_password
+KMUSIC_KEY_ALIAS=your_alias
+KMUSIC_KEY_PASSWORD=your_key_password

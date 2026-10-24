@@ -1,0 +1,168 @@
+{
+ "code": 200,
+ "playlist": {
+  "id": 2411629173,
+  "name": "温柔英文歌-睡觉专用",
+  "coverImgUrl": "https://p1.music.126.net/kekg-DZw8y88nwhV8DUm8Q==/109951163540109251.jpg",
+  "trackCount": 8,
+  "playCount": 45934884,
+  "description": "每日一首，循环♥\n晚安月亮，晚安大海，晚安陌生人\n（温馨提示:记得把音量调小听哦~）",
+  "tracks": [
+   {
+    "id": 1878812258,
+    "name": "Head In The Clouds",
+    "ar": [
+     {
+      "id": 31213402,
+      "name": "Hayd"
+     }
+    ],
+    "al": {
+     "id": 133357885,
+     "name": "Changes - EP",
+     "picUrl": "http://p4.music.126.net/NQ6pIqUwA0NdRh6szqyQsQ==/109951166421319018.jpg"
+    },
+    "dt": 184559
+   },
+   {
+    "id": 1911442482,
+    "name": "The Nights",
+    "ar": [
+     {
+      "id": 51179670,
+      "name": "Alyson Mary"
+     }
+    ],
+    "al": {
+     "id": 138773843,
+     "name": "The Nights",
+     "picUrl": "http://p3.music.126.net/4sh1Yty6qPO25PHWvhHAGw==/109951166925141728.jpg"
+    },
+    "dt": 228750
+   },
+   {
+    "id": 1355851077,
+    "name": "i'm tired, i'm exhausted",
+    "ar": [
+     {
+      "id": 12524181,
+      "name": "hateful"
+     }
+    ],
+    "al": {
+     "id": 78267153,
+     "name": "i'm tired, i'm exhausted",
+     "picUrl": "http://p3.music.126.net/iq7dMy3w8eI1UoG3MYcFfQ==/109951166383332908.jpg"
+    },
+    "dt": 142763
+   },
+   {
+    "id": 1995986945,
+    "name": "Why",
+    "ar": [
+     {
+      "id": 34787931,
+      "name": "REDRUM MUSIC"
+     }
+    ],
+    "al": {
+     "id": 154476983,
+     "name": "I Don't Know Why",
+     "picUrl": "http://p4.music.126.net/DGMypg-L7VZh-m7PUnzFBw==/109951168035630764.jpg"
+    },
+    "dt": 91636
+   },
+   {
+    "id": 3395514231,
+    "name": "almost july",
+    "ar": [
+     {
+      "id": 12552554,
+      "name": "Selina华"
+     }
+    ],
+    "al": {
+     "id": 382443968,
+     "name": "almost july",
+     "picUrl": "http://p4.music.126.net/uBP-Vtz7vdUufzO8P6w_CA==/109951173414899161.jpg"
+    },
+    "dt": 229316
+   },
+   {
+    "id": 2925124,
+    "name": "Fais Do Do",
+    "ar": [
+     {
+      "id": 64162,
+      "name": "Lisa Loeb"
+     }
+    ],
+    "al": {
+     "id": 295394,
+     "name": "Catch the Moon",
+     "picUrl": "http://p3.music.126.net/iy9IRSCKQ2wT1Nj4570c5A==/109951169233169807.jpg"
+    },
+    "dt": 96453
+   },
+   {
+    "id": 2748099,
+    "name": "Loving Hannah",
+    "ar": [
+     {
+      "id": 60355,
+      "name": "Isobel Campbell"
+     }
+    ],
+    "al": {
+     "id": 277278,
+     "name": "Milk White Sheets",
+     "picUrl": "http://p3.music.126.net/0Cq8Zi5EaPp668l16jXSMA==/1651466464924900.jpg"
+    },
+    "dt": 198306
+   },
+   {
+    "id": 2704068783,
+    "name": "Fly Away With You",
+    "ar": [
+     {
+      "id": 255735,
+      "name": "Sylva"
+     }
+    ],
+    "al": {
+     "id": 271698926,
+     "name": "Fly Away With You",
+     "picUrl": "http://p4.music.126.net/B4_--COPKM2gKnnlD-Y5UA==/109951170976179519.jpg"
+    },
+    "dt": 164747
+   }
+  ],
+  "trackIds": [
+   {
+    "id": 1878812258
+   },
+   {
+    "id": 1911442482
+   },
+   {
+    "id": 1355851077
+   },
+   {
+    "id": 1995986945
+   },
+   {
+    "id": 3395514231
+   },
+   {
+    "id": 2925124
+   },
+   {
+    "id": 2748099
+   },
+   {
+    "id": 2704068783
+   }
+  ]
+ },
+ "from": "music.gdstudio.xyz"
+}
