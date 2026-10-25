@@ -117,6 +117,9 @@ fun ProfileScreen(
     onDsdBypassEqChange: (Boolean) -> Unit = {},
     wifiOnlyDownload: Boolean,
     onWifiOnlyDownloadChange: (Boolean) -> Unit,
+    /** 冷启动后自动接着播（默认关：停在原位等用户按播放） */
+    autoResumePlayback: Boolean = false,
+    onAutoResumePlaybackChange: (Boolean) -> Unit = {},
     /** 导出诊断日志（歌词排查用）。为空则不显示入口 */
     onExportDiagLog: (() -> Unit)? = null,
     onClearDiagLog: (() -> Unit)? = null,
@@ -879,6 +882,18 @@ fun ProfileScreen(
         }
 
         item { SectionHeader(text = "播放", modifier = Modifier.padding(top = 16.wdp)) }
+        item {
+            SettingSwitchRow(
+                title = "自动接着播",
+                subtitle = if (autoResumePlayback) {
+                    "已开启：打开 App 就从上次断开的位置继续播"
+                } else {
+                    "打开 App 时恢复到上次的歌单和进度，停在那儿等你按播放"
+                },
+                checked = autoResumePlayback,
+                onCheckedChange = onAutoResumePlaybackChange
+            )
+        }
         item {
             SettingRow(
                 title = "睡眠定时",

@@ -65,6 +65,8 @@ class SettingsStore(private val context: Context) {
     private val dsdOutRateKey = intPreferencesKey("dsd_out_rate")
     /** DSD 自动旁路均衡器 */
     private val dsdBypassEqKey = booleanPreferencesKey("dsd_bypass_eq")
+    /** 冷启动后自动接着播（默认关：重开停在原位等用户按播放） */
+    private val autoResumeKey = booleanPreferencesKey("auto_resume_playback")
 
     // ── AI 导赏（OpenAI 兼容接口，key 由用户自己填）──
     private val aiEndpointKey = stringPreferencesKey("ai_endpoint")
@@ -252,6 +254,18 @@ class SettingsStore(private val context: Context) {
     }
 
     suspend fun setAudioOffload(on: Boolean) { context.dataStore.edit { it[offloadKey] = on } }
+
+    /**
+     * 冷启动后自动接着播。
+     *
+     * 默认**关**：重开 App 时停在原位等用户按播放 —— 一进 App 就外放会吓人
+     * （尤其在办公室/车里接蓝牙时）。想要「像没退出过一样」的用户可以自己打开。
+     */
+    val autoResumePlayback: Flow<Boolean> = context.dataStore.data.map { it[autoResumeKey] ?: false }
+
+    suspend fun setAutoResumePlayback(on: Boolean) {
+        context.dataStore.edit { it[autoResumeKey] = on }
+    }
 
     val themeMode: Flow<ThemeMode> = context.dataStore.data.map { prefs ->
         when (prefs[themeKey]) {

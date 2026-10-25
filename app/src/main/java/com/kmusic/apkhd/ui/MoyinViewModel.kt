@@ -24,6 +24,8 @@ import com.kmusic.apkhd.data.CachedSafEntry
 import com.kmusic.apkhd.data.ScanCacheData
 import com.kmusic.apkhd.model.LocalFolder
 import com.kmusic.apkhd.data.RecentStore
+import com.kmusic.apkhd.data.PlaybackSnapshotStore
+import com.kmusic.apkhd.model.PlaybackSnapshot
 import com.kmusic.apkhd.data.SettingsStore
 import com.kmusic.apkhd.data.SourceCatalog
 import com.kmusic.apkhd.model.LyricLine
@@ -85,6 +87,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import com.kmusic.apkhd.playback.PlaylistOrder
+import com.kmusic.apkhd.playback.ResumePlan
 import com.kmusic.apkhd.data.UserPlaylistStore
 import com.kmusic.apkhd.data.PlaylistFavStore
 import com.kmusic.apkhd.model.UserPlaylist
@@ -155,6 +158,14 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     private val lyricsRepo = LyricRepository()
     private val loudnessStore = LoudnessStore(app)
     val settings = SettingsStore(app)
+
+    /**
+     * 播放会话落盘（队列 + 位置）。
+     *
+     * 冷启动恢复要靠它 —— 队列只活在内存里的话，进程一死就全没了。
+     * 位置单独一个文件，见 [PlaybackSnapshotStore] 的注释。
+     */
+    private val snapshotStore = PlaybackSnapshotStore(app)
 
     private var navidrome: NavidromeClient? = null
 
@@ -597,6 +608,8 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                     error = null,
                     durationMs = if (t.durationMs > 0) t.durationMs else playbackState.durationMs
                 )
+                // 自动连播 / 通知栏切歌也会走到这里 —— 队列没变、当前曲变了，照样要落盘
+                persistSession()
                 // 切歌清音质检测结果：不清的话，界面上还挂着上一首的「实测截止」，
                 // 用户会以为这首也测过了（假数据比没数据更糟）。
                 clearProbe()
@@ -634,6 +647,12 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                     pendingSeekMs = 0L
                     runCatching { c.seekTo(target) }
                 }
+                // 恢复流程走完：位置已落位，闸门放开，让进度条回到跟播放器走
+                if (state == Player.STATE_READY && restoring) {
+                    restoreWatchdog?.cancel()
+                    restoreWatchdog = null
+                    restoring = false
+                }
             }
         })
     }
@@ -660,6 +679,9 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         get() = _queue
         private set(value) {
             _queue = value
+            // 队列一变就落盘（防抖 400ms）。增删、排序、整体换歌单都会经过这里，
+            // 集中一处比在每个调用点手写一行可靠得多。
+            persistSession()
         }
     var queueIndex by mutableStateOf(-1)
         private set
@@ -1955,8 +1977,11 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         davRetried.clear()
         streamRetried.clear()
         consecutivePlayErrors = 0
+        // 用户主动点歌 → 丢掉「上次没播完的位置」，从此按新歌走
+        restoredPositionMs = -1L
         queue = queueList
         queueIndex = queueList.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
+        persistSession()
         playCurrent()
     }
 
@@ -1979,6 +2004,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun playCurrent() {
         if (queue.getOrNull(queueIndex) == null) return
+        // 走普通起播 = 放弃「上次没播完的位置」，从 0 开始
+        restoredPositionMs = -1L
+        // 冷启动恢复后闸门是关着的（防止进度条被播放器的 0 覆盖）；用户这时点别的歌
+        // 必须放开它，否则进度条再也不跟播放器走了
+        restoring = false
+        restoreWatchdog?.cancel()
+        restoreWatchdog = null
         val start = queueIndex
         playJob?.cancel()
         playJob = viewModelScope.launch { playLoop(start) }
@@ -2110,6 +2142,8 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         // 首次起播不走 onMediaItemTransition（同一首重复点也一样），
         // 这里补一次，否则「点开第一首」永远没有响度归一
         applyLoudness(t)
+        // 同上：第一次起播没有 transition，当前曲变了要自己落一次盘
+        persistSession()
     }
 
     /**
@@ -2513,6 +2547,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun togglePlay() {
         val p = controller ?: return
+        // 冷启动恢复的这首歌还没交给播放器：按播放 = 从上次的位置接着播。
+        // 必须先判这一条 —— 播放器此刻是 STATE_IDLE，落到下面的 broken 分支
+        // 会走 play(t, queue) 从头开始，把恢复的位置浪费掉。
+        if (restoredPositionMs >= 0L && queue.getOrNull(queueIndex) != null) {
+            startRestoredPlayback(autoPlay = true)
+            return
+        }
         val broken = runCatching { p.playerError != null || p.playbackState == Player.STATE_IDLE }
             .getOrDefault(false)
         if (broken) {
@@ -2589,10 +2630,24 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         else runCatching { p.duration }.getOrDefault(0L)
         if (dur <= 0) return
         val target = (fraction.coerceIn(0f, 1f) * dur).toLong()
+        // 恢复出来但还没起播：拖动只是改「待播位置」，等按播放时才真正 seek。
+        // 直接 p.seekTo 到 IDLE 的播放器不会报错但也不会生效，进度条会立刻弹回。
+        if (restoredPositionMs >= 0L) {
+            restoredPositionMs = target
+            playbackState = playbackState.copy(positionMs = target)
+            // 拖完就退出 App 的话，这个新位置必须落盘
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { snapshotStore.savePosition(target) }
+            }
+            return
+        }
         seekTarget = target
         seekGuardUntil = android.os.SystemClock.elapsedRealtime() + 800
         runCatching { p.seekTo(target) }
         playbackState = playbackState.copy(positionMs = target)
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { snapshotStore.savePosition(target) }
+        }
     }
 
     /** 重新进入搜索页时清空上次的搜索态，回到历史记录 */
@@ -3642,6 +3697,255 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         if (dest != fromAt) runCatching { c.moveMediaItem(fromAt, dest) }
     }
 
+    // ---------------- 播放会话：落盘与恢复 ----------------
+
+    /**
+     * 恢复期闸门。
+     *
+     * 从「刚 setMediaItems 还没 prepare」到「READY 并 seek 到位」这段时间，播放器报的位置
+     * 是 0 —— 不拦住，进度条会先跳到 0 再跳回来，看起来像「恢复失败」。
+     * 同时它也是落盘闸门：恢复过程中不该把半成品状态写回文件。
+     */
+    private var restoring = false
+
+    /** 恢复待播的位置（毫秒）；<0 = 没有待恢复的会话 */
+    private var restoredPositionMs = -1L
+
+    /** 恢复看门狗：READY 迟迟不来（无网/源挂了）也要把闸门放开，否则进度条永远冻住 */
+    private var restoreWatchdog: Job? = null
+
+    /** 队列/当前曲变化后的落盘任务（防抖：一次拖动排序会连着改好几次） */
+    private var persistJob: Job? = null
+
+    /** 冷启动后自动接着播（设置项，默认关：停在原位等用户按播放） */
+    var autoResumePlayback by mutableStateOf(false)
+        private set
+
+    fun changeAutoResumePlayback(on: Boolean) {
+        autoResumePlayback = on
+        viewModelScope.launch { settings.setAutoResumePlayback(on) }
+    }
+
+    /**
+     * 把当前队列 + 当前曲目落盘。
+     *
+     * 防抖 400ms：拖动排序、批量加歌会连续改好几次 `queue`，每次都写几百 KB 太浪费。
+     * 恢复过程中直接跳过（见 [restoring]）。
+     */
+    private fun persistSession(delayMs: Long = 400, force: Boolean = false) {
+        // 恢复过程中一般不该写（怕把半成品写回去），但恢复**结束**时要用 force 存一次，
+        // 否则「恢复后拖了进度条就退出」这种情况下新位置会丢。
+        if (restoring && !force) return
+        persistJob?.cancel()
+        persistJob = viewModelScope.launch {
+            if (delayMs > 0) delay(delayMs)
+            if (restoring && !force) return@launch
+            val curId = queue.getOrNull(queueIndex)?.id ?: ""
+            if (queue.isEmpty() || curId.isEmpty()) {
+                runCatching { snapshotStore.clearQueue() }
+                return@launch
+            }
+            val snap = PlaybackSnapshot(
+                tracks = queue,
+                currentId = curId,
+                index = queueIndex.coerceAtLeast(0),
+                savedAt = System.currentTimeMillis()
+            )
+            runCatching { snapshotStore.saveQueue(snap) }
+        }
+    }
+
+    /**
+     * 冷启动（或重进 App）后接上上次的播放。
+     *
+     * 两条路必须分开：
+     *
+     * **A. 播放器还活着**（划掉任务卡片但没停播）—— 不覆盖它，反而以它为真相：
+     *    按 mediaId 从快照里找回曲目、把队列补进 ViewModel、同步进度和播放态。
+     *    以前这条路上 `playbackState.track` 一直是 null，迷你播放条要等自动切下一首
+     *    才冒出来 —— 现在顺手修掉。
+     *
+     * **B. 真的冷启动** —— 队列和位置从文件恢复，**但不立刻起播**：
+     *    直链是几分钟就过期的签名地址，起播必须重新取链。所以先把界面摆好
+     *    （曲名/封面/进度条都对），位置记在 [restoredPositionMs]，
+     *    等用户按播放（或设置里开了自动接着播）才真正交给播放器。
+     */
+    private suspend fun restoreLastSession(c: MediaController) {
+        if (queue.isNotEmpty()) return                       // 用户已经先点了歌，别覆盖
+        val snap = runCatching { snapshotStore.loadQueue() }.getOrNull() ?: return
+        val savedPos = runCatching { snapshotStore.loadPosition() }.getOrDefault(0L)
+        // 设置项此刻可能还没被 init 里的 collect 收上来，直接读一次最准
+        val autoPlay = runCatching { settings.autoResumePlayback.first() }
+            .getOrDefault(autoResumePlayback)
+
+        // ── 路径 A：播放器里还有东西（服务没死） ──
+        val aliveId = runCatching { c.currentMediaItem?.mediaId }.getOrNull()
+        if (c.mediaItemCount > 0 && !aliveId.isNullOrEmpty()) {
+            val inQueue = snap.tracks.indexOfFirst { it.id == aliveId }
+            // 快照里没有这首（快照太旧/被清过）→ 用播放器自带的元数据补一条，
+            // 至少迷你播放条和播放页能显示正确的曲名封面，而不是空着
+            val list = if (inQueue >= 0) snap.tracks else listOfNotNull(trackFromController(c, aliveId))
+            if (list.isEmpty()) return
+            restoring = true
+            queue = list
+            queueIndex = list.indexOfFirst { it.id == aliveId }.coerceAtLeast(0)
+            val cur = list[queueIndex]
+            val dur = runCatching { c.duration }.getOrDefault(0L).takeIf { it > 0 } ?: cur.durationMs
+            playbackState = PlaybackState(
+                track = cur,
+                isPlaying = runCatching { c.isPlaying }.getOrDefault(false),
+                positionMs = runCatching { c.currentPosition }.getOrDefault(0L),
+                durationMs = dur,
+                buffering = runCatching { c.playbackState == Player.STATE_BUFFERING }.getOrDefault(false),
+                error = null
+            )
+            restoring = false
+            restoredPositionMs = -1L
+            loadLyrics(cur)
+            applyLoudness(cur)
+            // 播放器里的 timeline 只有窗口内的几首，补齐后续（幂等，已有的不会重复加）
+            buildQueueAround(cur)
+            persistSession(delayMs = 1_000)
+            DiagLog.log("RESUME", "采纳存活播放器：'${cur.name}' pos=${playbackState.positionMs}ms 队列 ${list.size} 首")
+            return
+        }
+
+        // ── 路径 B：冷启动恢复 ──
+        val idx = ResumePlan.index(snap.tracks, snap.currentId, snap.index)
+        if (idx < 0) return
+        val target = snap.tracks[idx]
+        val dur = target.durationMs
+        // 剩不到 3 秒当作听完了：这首从头开始（否则一播放就结束，看起来像没恢复）
+        val pos = ResumePlan.positionMs(savedPos, dur)
+
+        restoring = true
+        queue = snap.tracks
+        queueIndex = idx
+        playbackState = PlaybackState(
+            track = target,
+            isPlaying = false,
+            positionMs = pos,
+            durationMs = dur,
+            buffering = false,
+            error = null
+        )
+        restoredPositionMs = pos
+        loadLyrics(target)
+        persistSession(delayMs = 1_000, force = true)
+        DiagLog.log("RESUME", "冷启动恢复队列：${snap.tracks.size} 首，当前第 ${idx + 1} 首 '${target.name}' pos=${pos}ms autoPlay=$autoPlay")
+
+        // 预热直链：不碰播放器（无网也不会弹错），只为用户按下播放时少等那 1~3 秒
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { resolveOnce(target) }
+        }
+        if (autoPlay) {
+            delay(60)          // 让 UI 先画出「这首歌 + 进度」，再起播
+            startRestoredPlayback(autoPlay = true)
+        }
+    }
+
+    /**
+     * 从播放器当前项反推一个 Track。
+     *
+     * 只在「快照里找不到这首」时用（快照被清/太旧）。曲名、歌手、封面都在
+     * MediaItem 的 metadata 里；`source` 猜不出来，按 mediaId 前缀判
+     * （`kw:` / `ne:` / `nd:` / `dav:` / `local:`），猜不出就留空 —— 只影响
+     * 「重新取链」时的分支，不影响当前这首继续播。
+     */
+    private fun trackFromController(c: MediaController, mediaId: String): Track? {
+        val mi = runCatching { c.currentMediaItem }.getOrNull() ?: return null
+        val md = mi.mediaMetadata
+        val source = when {
+            mediaId.startsWith("kw:") -> "kuwo"
+            mediaId.startsWith("ne:") -> "netease"
+            mediaId.startsWith("nd:") -> "navidrome"
+            mediaId.startsWith("dav:") -> "webdav"
+            mediaId.startsWith("local:") -> "local"
+            else -> ""
+        }
+        val sourceId = mediaId.substringAfter(':', "")
+        return Track(
+            id = mediaId,
+            name = md.title?.toString().orEmpty().ifEmpty { "未知曲目" },
+            artist = md.artist?.toString().orEmpty(),
+            album = md.albumTitle?.toString().orEmpty(),
+            coverUrl = md.artworkUri?.toString(),
+            durationMs = runCatching { c.duration }.getOrDefault(0L).coerceAtLeast(0L),
+            source = source,
+            sourceId = sourceId
+        )
+    }
+
+    /**
+     * 把 [restoredPositionMs] 这一首真正交给播放器。
+     *
+     * 只在两处调用：用户按了播放（[togglePlay]），或设置里开了自动接着播。
+     * 结束后清掉待恢复位置 —— 之后就是普通播放流程。
+     */
+    private fun startRestoredPlayback(autoPlay: Boolean) {
+        val t = queue.getOrNull(queueIndex) ?: return
+        val startAt = restoredPositionMs.coerceAtLeast(0L)
+        restoredPositionMs = -1L
+        playJob?.cancel()
+        playJob = viewModelScope.launch {
+            playbackState = playbackState.copy(track = t, buffering = true, error = null)
+            val resolved = resolveOnce(t)
+            if (resolved == null) {
+                playbackState = playbackState.copy(
+                    buffering = false,
+                    isPlaying = false,
+                    error = "上次的歌曲暂时取不到音源"
+                )
+                toast("上次的歌曲暂时取不到音源")
+                // 取不到就退回「把位置存着」，下次还能再试
+                restoredPositionMs = startAt
+                return@launch
+            }
+            val c = readyController() ?: run {
+                playbackState = playbackState.copy(buffering = false, error = "播放服务未就绪")
+                restoredPositionMs = startAt
+                return@launch
+            }
+            watchRestore()
+            c.setMediaItems(listOf(mediaItemOf(resolved)), 0, startAt)
+            c.prepare()
+            if (autoPlay) c.play()
+            // seek 交给 pendingSeekMs：READY 之后才真正落位（setMediaItems 的起始位置
+            // 在部分机型上会被 prepare 过程重置，显式 seek 一次最稳）
+            if (startAt > 0L) {
+                pendingSeekMs = startAt
+                seekTarget = startAt
+                seekGuardUntil = android.os.SystemClock.elapsedRealtime() + 3_000
+            }
+            playbackState = playbackState.copy(
+                track = resolved,
+                isPlaying = autoPlay,
+                buffering = true,
+                error = null,
+                positionMs = startAt,
+                durationMs = if (resolved.durationMs > 0) resolved.durationMs else playbackState.durationMs
+            )
+            applyLoudness(resolved)
+            loadLyrics(resolved)
+            buildQueueAround(resolved)
+            prefetchNext()
+            DiagLog.log("RESUME", "从 ${startAt}ms 接着播 '${resolved.name}' autoPlay=$autoPlay")
+        }
+    }
+
+    /** 恢复看门狗：READY 一直不来也要放开闸门，别让进度条冻在原位 */
+    private fun watchRestore() {
+        restoring = true
+        restoreWatchdog?.cancel()
+        restoreWatchdog = viewModelScope.launch {
+            delay(10_000)
+            if (restoring) {
+                restoring = false
+                DiagLog.log("RESUME", "恢复超时（10s 未 READY），放开位置闸门")
+            }
+        }
+    }
+
     // ---------------- 收藏 / 播放模式 / 音质偏好 ----------------
 
     /** 我喜欢的音乐（存完整曲目 JSON，不用回查） */
@@ -4025,6 +4329,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                         controller = it
                         attachControllerListener(it)
                         applyPlayMode(it)
+                        // 接上上次的播放：队列 + 当前曲 + 进度。
+                        // 播放器还活着就以它为准，真冷启动则只摆 UI、等用户按播放
+                        // （或设置里开了「自动接着播」）。
+                        viewModelScope.launch {
+                            runCatching { restoreLastSession(it) }
+                                .onFailure { e -> Log.w("MoyinVM", "恢复上次播放失败: ${e.message}") }
+                        }
                     }
                     .onFailure { Log.w("MoyinVM", "控制器连接失败: ${it.message}") }
             }, ContextCompat.getMainExecutor(ctx))
@@ -4093,6 +4404,8 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             settings.playMode.collect { playMode = it; controller?.let(::applyPlayMode) }
         }
+        // 自动接着播（冷启动后是否直接起播）
+        viewModelScope.launch { settings.autoResumePlayback.collect { autoResumePlayback = it } }
         viewModelScope.launch { settings.defaultQuality.collect { defaultQuality = it } }
         viewModelScope.launch { settings.cacheSizeGb.collect { cacheSizeGb = it } }
         viewModelScope.launch { settings.losslessFallback.collect { losslessFallback = it } }
@@ -4167,10 +4480,17 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         // 播放进度轮询（驱动进度条和歌词高亮）
+        var lastPersistAt = 0L
         viewModelScope.launch {
             while (isActive) {
                 val p = controller
                 if (p != null) {
+                    // 恢复期：播放器还没 prepare/seek 到位，它报的位置是 0 ——
+                    // 直接用会把进度条一到 0，看起来像「没恢复成功」
+                    if (restoring) {
+                        delay(100)
+                        continue
+                    }
                     val rawPos = runCatching { p.currentPosition }.getOrDefault(0L)
                     // seek 后 800ms 内强制用目标位置：Media3 异步 seek 未落地时读到的是旧值，
                     // 直接写回会让进度条「拖完弹回原处」
@@ -4201,6 +4521,14 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                         // 歌词高亮：只在换行时更新状态，别让整个列表跟着 100ms 抖
                         val line = computeLyricIndex()
                         if (line != currentLyricIndex) currentLyricIndex = line
+                        // 位置落盘：每 5 秒一次。App 被划掉/杀掉时，最多丢 5 秒进度
+                        val nowAt = android.os.SystemClock.elapsedRealtime()
+                        if (pos > 0L && nowAt - lastPersistAt >= 5_000L) {
+                            lastPersistAt = nowAt
+                            viewModelScope.launch(Dispatchers.IO) {
+                                runCatching { snapshotStore.savePosition(pos) }
+                            }
+                        }
                     }
                 }
                 delay(100)

@@ -744,6 +744,8 @@ fun MoyinRoot() {
                                 },
                                 wifiOnlyDownload = vm.wifiOnlyDownload,
                                 onWifiOnlyDownloadChange = vm::changeWifiOnlyDownload,
+                                autoResumePlayback = vm.autoResumePlayback,
+                                onAutoResumePlaybackChange = vm::changeAutoResumePlayback,
                                 aiEndpoint = vm.aiEndpoint,
                     aiApiKey = vm.aiApiKey,
                     aiModel = vm.aiModel,
