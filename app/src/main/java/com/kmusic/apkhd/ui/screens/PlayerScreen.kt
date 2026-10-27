@@ -59,11 +59,15 @@ import androidx.compose.ui.unit.sp
 import com.kmusic.apkhd.model.LyricLine
 import com.kmusic.apkhd.model.PlayMode
 import com.kmusic.apkhd.model.Track
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import com.kmusic.apkhd.net.GuideMarkup
 import com.kmusic.apkhd.ui.components.CoverArt
 import com.kmusic.apkhd.ui.components.VinylCover
 import com.kmusic.apkhd.audio.SpectrumProbe
 import com.kmusic.apkhd.ui.AudioInfo
 import com.kmusic.apkhd.ui.components.EqBandSliders
+import com.kmusic.apkhd.ui.components.SectionHeader
 import com.kmusic.apkhd.ui.components.MoyinIcon
 import com.kmusic.apkhd.ui.icons.IconBack
 import com.kmusic.apkhd.ui.icons.IconCheck
@@ -167,22 +171,18 @@ fun PlayerScreen(
     eqFreqs: List<Int> = emptyList(),
     /** 增益可调范围 [min, max] mB */
     eqRange: IntArray = intArrayOf(-1500, 1500),
+    /** 用户拖过滑块，曲线已不是预设（折叠行据此显示「自定义」而不是预设名） */
+    eqCustom: Boolean = false,
     onEqEnabledChange: (Boolean) -> Unit = {},
     onEqPresetChange: (Int) -> Unit = {},
     onRefreshEq: () -> Unit = {},
     onEqBandChange: (Int, Int) -> Unit = { _, _ -> },
     fxBass: Int = 0,
     onFxBassChange: (Int) -> Unit = {},
-    fxVirtual: Int = 0,
-    onFxVirtualChange: (Int) -> Unit = {},
     fxLoudness: Int = 0,
     onFxLoudnessChange: (Int) -> Unit = {},
-    fxReverb: Int = -1,
-    onFxReverbChange: (Int) -> Unit = {},
     fxBassAvailable: Boolean = false,
-    fxVirtualAvailable: Boolean = false,
     fxLoudnessAvailable: Boolean = false,
-    fxReverbAvailable: Boolean = false,
     /** 有项目是因为 effect 池被占满（而不是本机没有）才不可用 —— 可重挂恢复 */
     fxStarved: Boolean = false,
     eqStarved: Boolean = false,
@@ -193,15 +193,11 @@ fun PlayerScreen(
     /** 用户是否开启了 DSD 自动旁路 EQ */
     dsdBypassEq: Boolean = true,
     fxBassStarved: Boolean = false,
-    fxVirtualStarved: Boolean = false,
     fxLoudnessStarved: Boolean = false,
-    fxReverbStarved: Boolean = false,
-    fxDynamicsStarved: Boolean = false,
+    /** 本 App 此刻实际占用的系统音效池位数 */
+    fxHeldCount: Int = 0,
+    fxWantedCount: Int = 0,
     onReattachFx: () -> Unit = {},
-    /** 动态范围处理：0 关 / 1 轻 / 2 中 / 3 强 */
-    fxDynamics: Int = 0,
-    onFxDynamicsChange: (Int) -> Unit = {},
-    fxDynamicsAvailable: Boolean = false,
     /** 省电播放（offload）已开：音效全部不可用 */
     audioOffload: Boolean = false,
     // 音频信息 + AI 导赏
@@ -217,6 +213,10 @@ fun PlayerScreen(
     aiText: String = "",
     aiLoading: Boolean = false,
     aiError: String? = null,
+    /** 这篇导赏是否写完（false = 中途停止，只有半篇） */
+    aiComplete: Boolean = false,
+    /** 打开详情时调用：把已生成过的导赏读出来（只读缓存，不发起请求） */
+    onOpenInfo: () -> Unit = {},
     // 歌词翻译
     lyricTranslation: Map<Int, String> = emptyMap(),
     translating: Boolean = false,
@@ -479,7 +479,7 @@ fun PlayerScreen(
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                                 ToolItem(IconQueue, if (queue.isEmpty()) "队列" else "队列 ${queue.size}") { showQueue = true }
                                 ToolItem(IconEqualizer, "音效") { showEffects = true }
-                                ToolItem(IconInfo, "信息") { showInfo = true }
+                                ToolItem(IconInfo, "详情") { showInfo = true }
                             }
                         }
                     }
@@ -618,7 +618,7 @@ fun PlayerScreen(
                 ToolItem(IconLyrics, if (showLyrics) "封面" else "歌词") { showLyrics = !showLyrics }
                 ToolItem(IconQueue, if (queue.isEmpty()) "队列" else "队列 ${queue.size}") { showQueue = true }
                 ToolItem(IconEqualizer, "音效") { showEffects = true }
-                ToolItem(IconInfo, "信息") { showInfo = true }
+                ToolItem(IconInfo, "详情") { showInfo = true }
             }
             Spacer(Modifier.height(16.wdp))
             }
@@ -700,29 +700,22 @@ fun PlayerScreen(
                 eqBands = eqBands,
                 eqFreqs = eqFreqs,
                 eqRange = eqRange,
+                eqCustom = eqCustom,
                 onEqEnabledChange = onEqEnabledChange,
                 onEqPresetChange = onEqPresetChange,
                 onEqBandChange = onEqBandChange,
                 onRefreshEq = onRefreshEq,
                 fxBass = fxBass, onFxBassChange = onFxBassChange,
-                fxVirtual = fxVirtual, onFxVirtualChange = onFxVirtualChange,
                 fxLoudness = fxLoudness, onFxLoudnessChange = onFxLoudnessChange,
-                fxReverb = fxReverb, onFxReverbChange = onFxReverbChange,
                 fxBassAvailable = fxBassAvailable,
-                fxVirtualAvailable = fxVirtualAvailable,
                 fxLoudnessAvailable = fxLoudnessAvailable,
-                fxReverbAvailable = fxReverbAvailable,
                 fxStarved = fxStarved,
                 eqStarved = eqStarved,
                 fxBassStarved = fxBassStarved,
-                fxVirtualStarved = fxVirtualStarved,
                 fxLoudnessStarved = fxLoudnessStarved,
-                fxReverbStarved = fxReverbStarved,
-                fxDynamicsStarved = fxDynamicsStarved,
+                fxHeldCount = fxHeldCount,
+                fxWantedCount = fxWantedCount,
                 onReattachFx = onReattachFx,
-                fxDynamics = fxDynamics,
-                onFxDynamicsChange = onFxDynamicsChange,
-                fxDynamicsAvailable = fxDynamicsAvailable,
                 audioOffload = audioOffload,
                 dsdPlaying = dsdPlaying,
                 dsdLabel = dsdLabel,
@@ -735,7 +728,10 @@ fun PlayerScreen(
         }
 
         if (showInfo) {
+            // 打开就把已有的导赏读出来：用户不该因为关了面板就看不到自己花过钱的内容
+            LaunchedEffect(showInfo) { onOpenInfo() }
             InfoSheet(
+                track = track,
                 info = audioInfo,
                 loudnessGainDb = loudnessGainDb,
                 probeResult = probeResult,
@@ -747,6 +743,7 @@ fun PlayerScreen(
                 aiText = aiText,
                 aiLoading = aiLoading,
                 aiError = aiError,
+                aiComplete = aiComplete,
                 onRequestAi = onRequestAi,
                 onCancelAi = onCancelAi,
                 onOpenAiSettings = { showInfo = false; onOpenAiSettings() },
@@ -1368,29 +1365,23 @@ private fun EffectSheet(
     eqBands: List<Int>,
     eqFreqs: List<Int>,
     eqRange: IntArray,
+    eqCustom: Boolean,
     onEqEnabledChange: (Boolean) -> Unit,
     onEqPresetChange: (Int) -> Unit,
     onEqBandChange: (Int, Int) -> Unit,
     onRefreshEq: () -> Unit,
     fxBass: Int, onFxBassChange: (Int) -> Unit,
-    fxVirtual: Int, onFxVirtualChange: (Int) -> Unit,
     fxLoudness: Int, onFxLoudnessChange: (Int) -> Unit,
-    fxReverb: Int, onFxReverbChange: (Int) -> Unit,
     fxBassAvailable: Boolean,
-    fxVirtualAvailable: Boolean,
     fxLoudnessAvailable: Boolean,
-    fxReverbAvailable: Boolean,
     fxStarved: Boolean,
     eqStarved: Boolean,
     fxBassStarved: Boolean,
-    fxVirtualStarved: Boolean,
     fxLoudnessStarved: Boolean,
-    fxReverbStarved: Boolean,
-    fxDynamicsStarved: Boolean,
+    /** 本 App 此刻实际占用的系统音效池位数 */
+    fxHeldCount: Int = 0,
+    fxWantedCount: Int = 0,
     onReattachFx: () -> Unit,
-    fxDynamics: Int,
-    onFxDynamicsChange: (Int) -> Unit,
-    fxDynamicsAvailable: Boolean,
     audioOffload: Boolean,
     /** 正在播 DSD（音效面板据此提示「均衡器已自动旁路」） */
     dsdPlaying: Boolean = false,
@@ -1408,6 +1399,9 @@ private fun EffectSheet(
     // 只依赖 sessionVersion 会漏掉这种情况，用户看到的就是「只有开关没有滑块」
     LaunchedEffect(Unit) { onRefreshEq() }
     var expanded by remember { mutableStateOf<String?>(null) }
+    // 5 段滑块默认收起：这些滑块常驻时，手指落在上面就等于改曲线（面板本身要上下滚）。
+    // 注意只折滑块 —— 均衡器/预设/低音/响度这些行始终可见。
+    var slidersOpen by remember { mutableStateOf(false) }
     val noInd = { _: MutableInteractionSource -> }
 
     Box(
@@ -1441,13 +1435,34 @@ private fun EffectSheet(
                 .verticalScroll(rememberScrollState())
                 .padding(top = 16.wdp, bottom = 28.wdp)
         ) {
-            Text(
-                "音效",
-                color = c.t1,
-                fontSize = 16.wsp,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier.padding(horizontal = 18.wdp)
-            )
+            // 标题行右侧给一个真正点得到的关闭键。
+            // 之前只有「音效」两个字，用户想关面板只能点遮罩（容易误触到下层控件）或按返回键。
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 18.wdp, end = 10.wdp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "音效",
+                    color = c.t1,
+                    fontSize = 16.wsp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f)
+                )
+                Box(
+                    Modifier
+                        .size(40.wdp)
+                        .clip(RoundedCornerShape(20.wdp))
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { onDismiss() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("关闭", color = c.t3, fontSize = 12.wsp)
+                }
+            }
             Spacer(Modifier.height(6.wdp))
 
             if (audioOffload) {
@@ -1487,6 +1502,10 @@ private fun EffectSheet(
             }
             if (eqBands.isNotEmpty()) {
                 val eqBypassed = dsdPlaying && dsdBypassEq
+                val presetLabel = eqPresets.getOrNull(eqPreset) ?: eqPresets.firstOrNull()
+                val presetName = if (eqCustom) "自定义" else presetLabel
+                // 音效行常显、点整行切开关 —— 和低音/响度保持一致。
+                // 折叠只针对下面那排滑块：滑块常驻时手指落在上面很容易误拖。
                 EffectRow(
                     "均衡器",
                     when {
@@ -1495,34 +1514,47 @@ private fun EffectSheet(
                         else -> "关"
                     },
                     arrow = false
-                ) {
-                    onEqEnabledChange(!eqEnabled)
-                }
+                ) { onEqEnabledChange(!eqEnabled) }
+
                 if (eqPresets.isNotEmpty()) {
-                    // ⚠️ 这一行**必须始终渲染**，不能塞进 `if (eqEnabled)` 里。
-                    // 拖动频段会自动打开均衡器（changeEqBand 里 eqEnabled = true），
-                    // 如果预设行是条件渲染，第一次拖动时它会突然插进来，
-                    // 底部对齐的面板（Alignment.BottomCenter + heightIn）整体上移 74px，
-                    // 手指底下的滑块跟着跳走 —— 表现就是「第一次拖动之后再也拖不准」。
-                    // 面板高度必须恒定，滑块在屏幕上的位置才不会变。
                     EffectRow(
                         "预设",
-                        eqPresets.getOrNull(eqPreset) ?: eqPresets.first(),
-                        arrow = true
+                        presetName ?: "",
+                        arrow = true,
+                        arrowExpanded = expanded == "eq"
                     ) { expanded = if (expanded == "eq") null else "eq" }
                     if (expanded == "eq") {
                         ChipRow(
                             options = eqPresets.mapIndexed { i, n -> i.toString() to n },
                             selected = eqPreset.toString()
-                        ) { onEqPresetChange(it.toInt()) }
+                        ) {
+                            onEqPresetChange(it.toInt())
+                            expanded = null   // 选完就把 chip 行收起来，别一直占着
+                        }
                     }
                 }
-                EqBandSliders(
-                    bands = eqBands,
-                    freqs = eqFreqs,
-                    range = eqRange,
-                    onBandChange = onEqBandChange
-                )
+
+                // 只有这排 5 段滑块是可折叠的：默认收起，展开后才出现，
+                // 展开后也只有手柄能拖（见 EqBandSliders 的防误触说明）。
+                EffectRow(
+                    "频段调整",
+                    if (slidersOpen) "收起" else "展开",
+                    arrow = true,
+                    arrowExpanded = slidersOpen,
+                    subtitle = buildString {
+                        append(if (eqCustom) "自定义" else presetLabel ?: "原声")
+                        append(" · ${eqBands.size} 段")
+                        if (!eqEnabled) append(" · 均衡器关闭中")
+                    }
+                ) { slidersOpen = !slidersOpen }
+                if (slidersOpen) {
+                    EqBandSliders(
+                        bands = eqBands,
+                        freqs = eqFreqs,
+                        range = eqRange,
+                        onBandChange = onEqBandChange
+                    )
+                }
             }
 
             // 增强项一律显示：不可用时灰掉并说明原因。
@@ -1539,16 +1571,6 @@ private fun EffectSheet(
                 ChipRow(FX_STRENGTH_STEPS, fxBass.toString()) { onFxBassChange(it.toInt()) }
             }
             FxRow(
-                title = "环绕增强",
-                value = if (fxVirtualAvailable) fxStrengthLabel(fxVirtual) else "不可用",
-                available = fxVirtualAvailable && !audioOffload && !fxVirtualStarved,
-                starved = fxVirtualStarved,
-                expanded = expanded == "virt",
-                onClick = { expanded = if (expanded == "virt") null else "virt" }
-            ) {
-                ChipRow(FX_STRENGTH_STEPS, fxVirtual.toString()) { onFxVirtualChange(it.toInt()) }
-            }
-            FxRow(
                 title = "响度增强",
                 value = if (fxLoudnessAvailable) {
                     if (fxLoudness <= 0) "关" else "+${fxLoudness / 100} dB"
@@ -1560,31 +1582,29 @@ private fun EffectSheet(
             ) {
                 ChipRow(FX_LOUD_STEPS, fxLoudness.toString()) { onFxLoudnessChange(it.toInt()) }
             }
-            FxRow(
-                title = "动态范围",
-                value = if (fxDynamicsAvailable) fxDynamicsLabel(fxDynamics) else "不可用",
-                available = fxDynamicsAvailable && !audioOffload && !fxDynamicsStarved,
-                starved = fxDynamicsStarved,
-                expanded = expanded == "dyn",
-                onClick = { expanded = if (expanded == "dyn") null else "dyn" }
-            ) {
-                ChipRow(FX_DYNAMICS_STEPS, fxDynamics.toString()) { onFxDynamicsChange(it.toInt()) }
-            }
-            FxRow(
-                title = "混响",
-                value = if (fxReverbAvailable) fxReverbLabel(fxReverb) else "不可用",
-                available = fxReverbAvailable && !audioOffload && !fxReverbStarved,
-                starved = fxReverbStarved,
-                expanded = expanded == "reverb",
-                onClick = { expanded = if (expanded == "reverb") null else "reverb" }
-            ) {
-                ChipRow(FX_REVERB_STEPS, fxReverb.toString()) { onFxReverbChange(it.toInt()) }
-            }
 
             // 手动「重挂音效链」入口已移除。
-            // 理由：用户点它十次有九次没反应（池位回收是异步的，重建几乎必然再失败），
+            // 理由：用户点它十次有九次没反应（池位回收是异步的，重建必然再失败），
             // 反而让人以为功能坏了。现在改成**失败自动退避重试**（见 MoyinPlaybackService），
             // 抢得回来就自己抢回来，抢不回来就是本机不支持 —— 不需要用户操心。
+
+            // 池位占用：把「关掉的项到底占不占地方」直接摊开说。
+            // 这一行是这一版的核心承诺 —— 全关 = 0 项，开一项 = 1 项。
+            if (!audioOffload) {
+                Text(
+                    when {
+                        // 有开关打开、但池位为 0 = 暂停超时后已归还，不能写成"全部关闭"（那是在撒谎）
+                        fxHeldCount == 0 && fxWantedCount > 0 ->
+                            "当前占用：0 项系统音效（暂停中已暂时归还，按播放会重新申请）"
+                        fxHeldCount == 0 -> "当前占用：0 项系统音效（全部关闭，池位已归还）"
+                        else -> "当前占用：$fxHeldCount 项系统音效"
+                    },
+                    color = c.t3,
+                    fontSize = 11.wsp,
+                    lineHeight = 17.wsp,
+                    modifier = Modifier.padding(horizontal = 18.wdp, vertical = 6.wdp)
+                )
+            }
 
             Spacer(Modifier.height(4.wdp))
             Box(
@@ -1614,9 +1634,18 @@ private fun EffectRow(
     title: String,
     value: String,
     arrow: Boolean = true,
+    /** 标题下面的一行小字说明（例如「摇滚 · 5 段」）；null 时不占高度 */
+    subtitle: String? = null,
+    /** 非空时箭头随展开状态旋转 90°（收起 → 展开），让「这一行能点开」看得出来 */
+    arrowExpanded: Boolean? = null,
     onClick: () -> Unit
 ) {
     val c = moyinColors()
+    val arrowAngle by animateFloatAsState(
+        targetValue = if (arrowExpanded == true) 90f else 0f,
+        animationSpec = tween(160),
+        label = "effectRowArrow"
+    )
     Row(
         Modifier
             .fillMaxWidth()
@@ -1627,11 +1656,28 @@ private fun EffectRow(
             .padding(horizontal = 18.wdp, vertical = 13.wdp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(title, color = c.t1, fontSize = 14.wsp, modifier = Modifier.weight(1f))
+        Column(Modifier.weight(1f)) {
+            Text(title, color = c.t1, fontSize = 14.wsp)
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    color = c.t3,
+                    fontSize = 11.wsp,
+                    lineHeight = 15.wsp,
+                    modifier = Modifier.padding(top = 2.wdp)
+                )
+            }
+        }
         Text(value, color = c.t3, fontSize = 13.wsp)
         if (arrow) {
             Spacer(Modifier.width(4.wdp))
-            MoyinIcon(IconChevronRight, tint = c.t3, size = 13.wdp)
+            MoyinIcon(
+                IconChevronRight,
+                tint = c.t3,
+                size = 13.wdp,
+                modifier = if (arrowExpanded == null) Modifier
+                else Modifier.graphicsLayer { rotationZ = arrowAngle }
+            )
         }
     }
 }
@@ -1732,13 +1778,6 @@ private val FX_STRENGTH_STEPS = listOf(
 private val FX_LOUD_STEPS = listOf(
     "0" to "关", "300" to "+3 dB", "600" to "+6 dB", "900" to "+9 dB", "1200" to "+12 dB"
 )
-private val FX_REVERB_STEPS = listOf(
-    "-1" to "关", "1" to "小房间", "2" to "中房间", "3" to "大房间",
-    "4" to "中厅", "5" to "大厅", "6" to "板式"
-)
-private val FX_DYNAMICS_STEPS = listOf(
-    "0" to "关", "1" to "轻", "2" to "中", "3" to "强"
-)
 private val SLEEP_STEPS = listOf(
     "0" to "关", "15" to "15 分钟", "30" to "30 分钟",
     "45" to "45 分钟", "60" to "1 小时", "90" to "1.5 小时"
@@ -1751,12 +1790,6 @@ private fun fxStrengthLabel(v: Int) = when {
     v < 875 -> "强"
     else -> "极强"
 }
-
-private fun fxReverbLabel(v: Int) =
-    FX_REVERB_STEPS.firstOrNull { it.first == v.toString() }?.second ?: "关"
-
-private fun fxDynamicsLabel(v: Int) =
-    FX_DYNAMICS_STEPS.firstOrNull { it.first == v.toString() }?.second ?: "关"
 
 @Composable
 private fun OptionSheet(
@@ -2055,13 +2088,25 @@ private fun ElapsedTimeText(
 }
 
 /**
- * 音频信息 + AI 导赏。
+ * 曲目详情：`导赏` / `音频信息` 两段。
  *
- * 音频参数只列能核实的东西（见 [AudioInfo] 注释：刻意没有位深）。
- * AI 导赏必须用户自己配 key —— 没配就引导去设置，不摆一个点了只会报错的按钮。
+ * ## 为什么分成两段
+ *
+ * 原来技术参数在上、导赏在下同屏滚动：10 行参数占掉 260dp，抽屉上限 580dp，
+ * 留给正文的不到 300dp —— 读一篇 400 字要全程滚。而「这首是什么格式」
+ * 与「这首好在哪里」本来就是两件事，上下堆在一起等于每次看导赏都先翻一遍设备参数。
+ *
+ * 现在默认停在导赏，参数挪到第二段，两个都还是同一个入口（「详情」），不多占工具条。
+ *
+ * ## 导赏的排版
+ *
+ * 正文由 [GuideMarkup] 解析成标题/段落/引用/列表四类块，分别给不同字号与间距。
+ * 解析是**容错**的：模型不守结构约定就退化成普通段落，绝不会整篇消失。
+ * 模型偶尔吐 Markdown 标记（`###`、`---`、`**`）也因此不会漏到屏幕上。
  */
 @Composable
 private fun InfoSheet(
+    track: Track?,
     info: AudioInfo?,
     loudnessGainDb: Float,
     probeResult: SpectrumProbe.Result?,
@@ -2073,12 +2118,18 @@ private fun InfoSheet(
     aiText: String,
     aiLoading: Boolean,
     aiError: String?,
+    /** 这篇是否写完了（false = 用户中途停止，只有半篇） */
+    aiComplete: Boolean,
     onRequestAi: () -> Unit,
     onCancelAi: () -> Unit,
     onOpenAiSettings: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val c = moyinColors()
+    val clipboard = LocalClipboardManager.current
+
+    // 0 = 导赏，1 = 音频信息。默认导赏：用户点「详情」十次有九次是想看内容。
+    var tab by remember { mutableStateOf(0) }
 
     Box(
         Modifier
@@ -2091,12 +2142,16 @@ private fun InfoSheet(
     ) {
         // 宽屏横屏：右侧抽屉；窄屏：底部面板
         val drawer = window.isWide && window.widthDp > window.heightDp && window.heightDp >= 380
+        // 抽屉比原来高：导赏是长文，580dp 在竖屏上只够看十几行
+        val sheetMax = if (drawer) 0 else 640
+        val scroll = rememberScrollState()
+
         Column(
             Modifier
                 .align(if (drawer) Alignment.CenterEnd else Alignment.BottomCenter)
                 .then(
-                    if (drawer) Modifier.width(420.wdp).fillMaxHeight()
-                    else Modifier.fillMaxWidth().heightIn(max = 580.wdp)
+                    if (drawer) Modifier.width(440.wdp).fillMaxHeight()
+                    else Modifier.fillMaxWidth().heightIn(max = sheetMax.wdp)
                 )
                 .clip(
                     if (drawer) RoundedCornerShape(topStart = 20.wdp, bottomStart = 20.wdp)
@@ -2108,170 +2163,437 @@ private fun InfoSheet(
                     interactionSource = remember { MutableInteractionSource() }
                 ) { }
                 .sheetBottomPadding(!drawer)
-                .verticalScroll(rememberScrollState())
-                .padding(top = 16.wdp, bottom = 30.wdp)
         ) {
-            Text(
-                "音频信息",
-                color = c.t1,
-                fontSize = 16.wsp,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier.padding(horizontal = 18.wdp)
-            )
-            Spacer(Modifier.height(10.wdp))
-
-            if (info == null) {
-                Text(
-                    "播放器还没有输出音频轨",
-                    color = c.t3,
-                    fontSize = 13.wsp,
-                    modifier = Modifier.padding(horizontal = 18.wdp, vertical = 6.wdp)
-                )
-            } else {
-                InfoRow("格式", info.codec)
-                if (info.requestedLabel != null) {
-                    InfoRow(
-                        "请求档位",
-                        if (info.downgraded) "${info.requestedLabel}（源站未提供无损）"
-                        else info.requestedLabel
-                    )
-                }
-                InfoRow("源采样率", info.sampleRate?.let { fmtHz(it) } ?: "未知")
-                InfoRow(
-                    "声道",
-                    info.channels?.let {
-                        when (it) {
-                            1 -> "单声道"
-                            2 -> "双声道"
-                            else -> "$it 声道"
+            // ── 顶部：标题 + 分段 ──
+            Column(Modifier.padding(start = 18.wdp, end = 12.wdp, top = 14.wdp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "详情",
+                            color = c.t1,
+                            fontSize = 16.wsp,
+                            fontWeight = FontWeight.Medium
+                        )
+                        if (track != null) {
+                            Text(
+                                track.name + if (track.artist.isNotBlank()) " · ${track.artist}" else "",
+                                color = c.t3,
+                                fontSize = 11.wsp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(top = 2.wdp)
+                            )
                         }
-                    } ?: "未知"
+                    }
+                    // 关闭按钮给足 40dp 命中区 —— 原来只有文字本身高度，实测点不到
+                    Box(
+                        Modifier
+                            .size(40.wdp)
+                            .clip(RoundedCornerShape(20.wdp))
+                            .clickable(
+                                indication = null,
+                                interactionSource = remember { MutableInteractionSource() }
+                            ) { onDismiss() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        MoyinIcon(IconChevronRight, tint = c.t3, size = 16.wdp)
+                    }
+                }
+                Spacer(Modifier.height(12.wdp))
+
+                // 分段控件：不用 Material TabRow —— 它的指示器颜色和高度很难跟上主题
+                SegmentBar(
+                    labels = listOf("导赏", "音频信息"),
+                    selected = tab,
+                    onSelect = { tab = it }
                 )
-                InfoRow("码率", info.bitrateKbps?.let { "$it kbps" } ?: "未知")
-                InfoRow("设备输出", info.outSampleRate?.let { fmtHz(it) } ?: "未知")
-                val sr = info.sampleRate
-                val osr = info.outSampleRate
-                if (sr != null && osr != null && sr != osr) {
-                    InfoRow("重采样", "是（${fmtHz(sr)} → ${fmtHz(osr)}）")
-                }
-                InfoRow("缓冲余量", "%.1f s".format(info.bufferedMs / 1000f))
-                InfoRow("音源", info.sourceLabel)
-                if (loudnessGainDb != 0f) {
-                    InfoRow(
-                        "响度归一",
-                        (if (loudnessGainDb > 0) "+" else "") + "%.1f dB".format(loudnessGainDb)
-                    )
-                }
+                Spacer(Modifier.height(4.wdp))
             }
 
-            // ── 真实音质检测（只对本地文件）──
-            Spacer(Modifier.height(10.wdp))
-            if (canProbe) {
-                if (probeResult != null) {
-                    InfoRow("实测截止", fmtHz(probeResult.cutoffHz))
-                    InfoRow("推断音质", probeResult.verdict.label)
-                    Spacer(Modifier.height(6.wdp))
-                    InfoAction("重新检测", onProbe)
-                } else if (probeRunning) {
-                    Text(
-                        "正在解码分析…（整首，约 2~4 秒）",
-                        color = c.t3,
-                        fontSize = 12.wsp,
-                        modifier = Modifier.padding(horizontal = 18.wdp, vertical = 4.wdp)
+            Column(
+                Modifier
+                    .weight(1f, fill = false)
+                    .verticalScroll(scroll)
+                    .padding(bottom = 26.wdp)
+            ) {
+                if (tab == 0) {
+                    GuideSection(
+                        track = track,
+                        configured = aiConfigured,
+                        text = aiText,
+                        loading = aiLoading,
+                        error = aiError,
+                        complete = aiComplete,
+                        onRequest = onRequestAi,
+                        onCancel = onCancelAi,
+                        onOpenSettings = onOpenAiSettings,
+                        onCopy = { clipboard.setText(AnnotatedString(aiText)) }
                     )
                 } else {
-                    InfoAction("检测真实音质", onProbe)
-                }
-                probeError?.let {
-                    Text(
-                        it,
-                        color = c.t3,
-                        fontSize = 11.wsp,
-                        lineHeight = 16.wsp,
-                        modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
+                    AudioInfoSection(
+                        info = info,
+                        loudnessGainDb = loudnessGainDb,
+                        probeResult = probeResult,
+                        probeRunning = probeRunning,
+                        probeError = probeError,
+                        onProbe = onProbe,
+                        canProbe = canProbe
                     )
                 }
             }
+        }
+    }
+}
 
-            Spacer(Modifier.height(8.wdp))
+/**
+ * 两段式切换条。
+ *
+ * 自绘而不是用 Material 的 TabRow：这里的配色全部来自 [MoyinColors]，
+ * 浅色主题是「米白底 + 深色字 + 细下划线」，深色是「胶囊高亮」，
+ * 用 TabRow 的默认指示器两套都对不上。
+ */
+@Composable
+private fun SegmentBar(labels: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+    val c = moyinColors()
+    Row(horizontalArrangement = Arrangement.spacedBy(6.wdp)) {
+        labels.forEachIndexed { i, label ->
+            val on = i == selected
             Box(
                 Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 18.wdp)
-                    .height(1.dp)
-                    .background(if (c.isDark) Color(0x14FFFFFF) else Color(0x0F000000))
-            )
-            Spacer(Modifier.height(14.wdp))
+                    .clip(RoundedCornerShape(99.dp))
+                    .background(if (on) c.accentDim else Color.Transparent)
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() }
+                    ) { onSelect(i) }
+                    .padding(horizontal = 14.wdp, vertical = 7.wdp)
+            ) {
+                Text(
+                    label,
+                    color = if (on) c.accent else c.t3,
+                    fontSize = 13.wsp,
+                    fontWeight = if (on) FontWeight.Medium else FontWeight.Normal
+                )
+            }
+        }
+    }
+}
 
+/** 导赏段：空态 / 生成中 / 正文 / 出错 四种状态 */
+@Composable
+private fun GuideSection(
+    track: Track?,
+    configured: Boolean,
+    text: String,
+    loading: Boolean,
+    error: String?,
+    complete: Boolean,
+    onRequest: () -> Unit,
+    onCancel: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onCopy: () -> Unit
+) {
+    val c = moyinColors()
+
+    when {
+        !configured -> {
             Text(
-                "AI 导赏",
-                color = c.t1,
-                fontSize = 15.wsp,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier.padding(horizontal = 18.wdp)
+                "填入自己的 API Key 后才能生成。支持任何 OpenAI 兼容接口（默认 DeepSeek，也可以填 OpenAI / 通义 / 智谱）。",
+                color = c.t3,
+                fontSize = 12.wsp,
+                lineHeight = 18.wsp,
+                modifier = Modifier.padding(horizontal = 18.wdp, vertical = 6.wdp)
             )
             Spacer(Modifier.height(8.wdp))
+            InfoAction("去设置填 Key", onOpenSettings)
+        }
 
-            when {
-                !aiConfigured -> {
-                    Text(
-                        "填入自己的 API Key 后才能生成。支持任何 OpenAI 兼容接口（默认 DeepSeek，也可以填 OpenAI / 通义 / 智谱）。",
-                        color = c.t3,
-                        fontSize = 12.wsp,
-                        lineHeight = 18.wsp,
-                        modifier = Modifier.padding(horizontal = 18.wdp)
+        text.isNotBlank() -> {
+            GuideBody(text)
+            Spacer(Modifier.height(10.wdp))
+            Row(
+                Modifier.padding(horizontal = 18.wdp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (loading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(13.wdp),
+                        strokeWidth = 1.5.dp,
+                        color = c.accent
                     )
-                    Spacer(Modifier.height(10.wdp))
-                    InfoAction("去设置填 Key", onOpenAiSettings)
+                    Spacer(Modifier.width(8.wdp))
+                    Text("正在生成…", color = c.t3, fontSize = 11.wsp)
+                    Spacer(Modifier.weight(1f))
+                    GuideTextAction("停止", onCancel)
+                } else {
+                    // 半篇和完篇要说清楚：用户点了「停止」以后不该以为自己拿到的是全篇
+                    Text(
+                        if (complete) "AI 生成 · 仅供鉴赏参考" else "已停止 · 内容未写完",
+                        color = c.t3,
+                        fontSize = 11.wsp
+                    )
+                    Spacer(Modifier.weight(1f))
+                    GuideTextAction("复制", onCopy)
+                    Spacer(Modifier.width(14.wdp))
+                    GuideTextAction(if (complete) "重新生成" else "继续生成", onRequest)
+                }
+            }
+        }
+
+        loading -> {
+            Row(
+                Modifier.padding(horizontal = 18.wdp, vertical = 10.wdp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(15.wdp),
+                    strokeWidth = 1.6.dp,
+                    color = c.accent
+                )
+                Spacer(Modifier.width(10.wdp))
+                Text("正在读歌词、组织文字…", color = c.t3, fontSize = 13.wsp)
+                Spacer(Modifier.weight(1f))
+                GuideTextAction("停止", onCancel)
+            }
+        }
+
+        error != null -> {
+            Text(
+                error,
+                color = c.t3,
+                fontSize = 12.wsp,
+                lineHeight = 18.wsp,
+                modifier = Modifier.padding(horizontal = 18.wdp, vertical = 6.wdp)
+            )
+            Spacer(Modifier.height(8.wdp))
+            InfoAction("重试", onRequest)
+        }
+
+        else -> {
+            if (track != null) {
+                Text(
+                    "把这首歌的创作背景、词作意象与编曲细节讲清楚，约 300 字。",
+                    color = c.t3,
+                    fontSize = 12.wsp,
+                    lineHeight = 18.wsp,
+                    modifier = Modifier.padding(horizontal = 18.wdp, vertical = 6.wdp)
+                )
+                Spacer(Modifier.height(8.wdp))
+            }
+            InfoAction("生成导赏", onRequest)
+        }
+    }
+}
+
+/** 底部一行的轻量文字按钮：不抢视觉，但命中区撑到 36dp 高 */
+@Composable
+private fun GuideTextAction(label: String, onClick: () -> Unit) {
+    val c = moyinColors()
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() }
+            ) { onClick() }
+            .padding(horizontal = 6.wdp, vertical = 8.wdp)
+    ) {
+        Text(label, color = c.accent, fontSize = 12.wsp, fontWeight = FontWeight.Medium)
+    }
+}
+
+/**
+ * 把 AI 正文按 [GuideMarkup] 的块渲染出来。
+ *
+ * 流式场景下每来一个 delta 就重新 parse 一次 —— 300~450 字的解析是线性的，
+ * 每帧重算的开销远小于一次网络往返，没必要做增量。
+ */
+@Composable
+private fun GuideBody(raw: String) {
+    val c = moyinColors()
+    val blocks = remember(raw) { GuideMarkup.parse(raw) }
+
+    // 底部 16dp：正文最后一行不该贴着「复制 / 重新生成」那一行状态栏
+    Column(Modifier.padding(start = 18.wdp, end = 18.wdp, top = 4.wdp, bottom = 16.wdp)) {
+        blocks.forEachIndexed { i, block ->
+            when (block) {
+                is GuideMarkup.Block.Lead -> {
+                    // 一句话主旨：比正文大一号，用主题强调色，作为整篇的入口
+                    Text(
+                        block.text,
+                        color = c.t1,
+                        fontSize = 19.wsp,
+                        lineHeight = 27.wsp,
+                        fontWeight = FontWeight.Medium,
+                        fontFamily = if (c.titleSerif) FontFamily.Serif else FontFamily.SansSerif,
+                        modifier = Modifier.padding(top = if (i == 0) 6.wdp else 0.dp, bottom = 10.wdp)
+                    )
                 }
 
-                aiText.isNotBlank() -> {
+                is GuideMarkup.Block.Section -> {
+                    // 复用 SectionHeader：深色套是小号大写灰字，浅色套是衬线粗体。
+                    // SectionHeader 自带 20dp 内边距，小标题上再补一点，跟正文拉开呼吸感
+                    SectionHeader(
+                        text = block.title,
+                        modifier = Modifier.padding(top = if (i == 0) 2.wdp else 10.wdp)
+                    )
+                }
+
+                is GuideMarkup.Block.Para -> {
                     Text(
-                        aiText,
+                        block.text,
                         color = c.t1,
                         fontSize = 14.wsp,
-                        lineHeight = 23.wsp,
-                        modifier = Modifier.padding(horizontal = 18.wdp)
+                        lineHeight = 24.wsp,
+                        modifier = Modifier.padding(bottom = 12.wdp)
                     )
-                    if (aiLoading) {
-                        Spacer(Modifier.height(6.wdp))
-                        Text(
-                            "正在生成…",
-                            color = c.t3,
-                            fontSize = 11.wsp,
-                            modifier = Modifier.padding(horizontal = 18.wdp)
-                        )
-                    }
                 }
 
-                aiLoading -> {
+                is GuideMarkup.Block.Quote -> {
+                    // 金句：左侧 3dp 强调竖条 + 稍大的字号。歌词是这篇里最该被看见的东西，
+                    // 混在正文段落里就白瞎了模型特意引用的那一句。
                     Row(
-                        Modifier.padding(horizontal = 18.wdp, vertical = 6.wdp),
-                        verticalAlignment = Alignment.CenterVertically
+                        Modifier
+                            .height(IntrinsicSize.Min)
+                            .padding(bottom = 12.wdp)
                     ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(15.wdp),
-                            strokeWidth = 1.6.dp,
-                            color = c.accent
+                        Box(
+                            Modifier
+                                .width(3.wdp)
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(c.accent)
                         )
-                        Spacer(Modifier.width(10.wdp))
-                        Text("正在生成…", color = c.t3, fontSize = 13.wsp)
+                        Spacer(Modifier.width(12.wdp))
+                        Column {
+                            block.lines.forEach { line ->
+                                Text(
+                                    "「$line」",
+                                    color = c.t2,
+                                    fontSize = 14.wsp,
+                                    lineHeight = 23.wsp,
+                                    fontFamily = if (c.titleSerif) FontFamily.Serif else FontFamily.SansSerif
+                                )
+                            }
+                        }
                     }
                 }
 
-                aiError != null -> {
-                    Text(
-                        aiError,
-                        color = c.t3,
-                        fontSize = 12.wsp,
-                        lineHeight = 18.wsp,
-                        modifier = Modifier.padding(horizontal = 18.wdp)
-                    )
-                    Spacer(Modifier.height(10.wdp))
-                    InfoAction("重试", onRequestAi)
+                is GuideMarkup.Block.Bullets -> {
+                    // 列表项之间 4dp，块前后留 12dp —— 项间距跟段间距一样大会散成一堆独立段落
+                    Column(Modifier.padding(top = 2.wdp, bottom = 12.wdp)) {
+                        block.items.forEachIndexed { index, item ->
+                            Row(Modifier.padding(top = if (index == 0) 0.dp else 4.wdp)) {
+                                Text("·", color = c.accent, fontSize = 14.wsp)
+                                Spacer(Modifier.width(8.wdp))
+                                Text(
+                                    item,
+                                    color = c.t1,
+                                    fontSize = 14.wsp,
+                                    lineHeight = 22.wsp
+                                )
+                            }
+                        }
+                    }
                 }
 
-                else -> InfoAction("生成导赏", onRequestAi)
+                GuideMarkup.Block.Rule -> {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 10.wdp)
+                            .height(1.dp)
+                            .background(if (c.isDark) Color(0x14FFFFFF) else Color(0x0F000000))
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 音频信息段：技术参数 + 真实音质检测 */
+@Composable
+private fun AudioInfoSection(
+    info: AudioInfo?,
+    loudnessGainDb: Float,
+    probeResult: SpectrumProbe.Result?,
+    probeRunning: Boolean,
+    probeError: String?,
+    onProbe: () -> Unit,
+    canProbe: Boolean
+) {
+    val c = moyinColors()
+    Column(Modifier.padding(top = 8.wdp)) {
+        if (info == null) {
+            Text(
+                "播放器还没有输出音频轨",
+                color = c.t3,
+                fontSize = 13.wsp,
+                modifier = Modifier.padding(horizontal = 18.wdp, vertical = 6.wdp)
+            )
+        } else {
+            InfoRow("格式", info.codec)
+            if (info.requestedLabel != null) {
+                InfoRow(
+                    "请求档位",
+                    if (info.downgraded) "${info.requestedLabel}（源站未提供无损）"
+                    else info.requestedLabel
+                )
+            }
+            InfoRow("源采样率", info.sampleRate?.let { fmtHz(it) } ?: "未知")
+            InfoRow(
+                "声道",
+                info.channels?.let {
+                    when (it) {
+                        1 -> "单声道"
+                        2 -> "双声道"
+                        else -> "$it 声道"
+                    }
+                } ?: "未知"
+            )
+            InfoRow("码率", info.bitrateKbps?.let { "$it kbps" } ?: "未知")
+            InfoRow("设备输出", info.outSampleRate?.let { fmtHz(it) } ?: "未知")
+            val sr = info.sampleRate
+            val osr = info.outSampleRate
+            if (sr != null && osr != null && sr != osr) {
+                InfoRow("重采样", "是（${fmtHz(sr)} → ${fmtHz(osr)}）")
+            }
+            InfoRow("缓冲余量", "%.1f s".format(info.bufferedMs / 1000f))
+            InfoRow("音源", info.sourceLabel)
+            if (loudnessGainDb != 0f) {
+                InfoRow(
+                    "响度归一",
+                    (if (loudnessGainDb > 0) "+" else "") + "%.1f dB".format(loudnessGainDb)
+                )
+            }
+        }
+
+        // ── 真实音质检测（只对本地文件）──
+        Spacer(Modifier.height(10.wdp))
+        if (canProbe) {
+            if (probeResult != null) {
+                InfoRow("实测截止", fmtHz(probeResult.cutoffHz))
+                InfoRow("推断音质", probeResult.verdict.label)
+                Spacer(Modifier.height(6.wdp))
+                InfoAction("重新检测", onProbe)
+            } else if (probeRunning) {
+                Text(
+                    "正在解码分析…（整首，约 2~4 秒）",
+                    color = c.t3,
+                    fontSize = 12.wsp,
+                    modifier = Modifier.padding(horizontal = 18.wdp, vertical = 4.wdp)
+                )
+            } else {
+                InfoAction("检测真实音质", onProbe)
+            }
+            probeError?.let {
+                Text(
+                    it,
+                    color = c.t3,
+                    fontSize = 11.wsp,
+                    lineHeight = 16.wsp,
+                    modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
+                )
             }
         }
     }

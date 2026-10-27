@@ -50,13 +50,12 @@ class SettingsStore(private val context: Context) {
     private val lyricFontKey = floatPreferencesKey("lyric_font_scale")
     private val eqEnabledKey = booleanPreferencesKey("eq_enabled")
     private val eqPresetKey = intPreferencesKey("eq_preset")
-    // 系统音效链：低音增强 / 环绕 / 响度 / 混响。0 或 -1 表示关闭
+    // 系统音效链：低音增强 / 响度增强。0 表示关闭
+    //
+    // v2.3.2 起环绕、混响、动态范围三项已删除（合并进统一音效实例后它们没有载体了）。
+    // 旧键 fx_virtual / fx_reverb / fx_dynamics 不再读取，DataStore 里残留的值不影响任何行为。
     private val fxBassKey = intPreferencesKey("fx_bass")
-    private val fxVirtualKey = intPreferencesKey("fx_virtual")
     private val fxLoudnessKey = intPreferencesKey("fx_loudness")
-    private val fxReverbKey = intPreferencesKey("fx_reverb")
-    /** 动态范围处理档位：0 关 / 1 轻 / 2 中 / 3 强 */
-    private val fxDynamicsKey = intPreferencesKey("fx_dynamics")
     /** 响度归一：off / track / album */
     private val loudnessModeKey = stringPreferencesKey("loudness_mode")
     /** 省电播放（offload）。开了就没有音效 */
@@ -196,19 +195,10 @@ class SettingsStore(private val context: Context) {
     }
 
     val fxBass: Flow<Int> = context.dataStore.data.map { it[fxBassKey] ?: 0 }
-    val fxVirtual: Flow<Int> = context.dataStore.data.map { it[fxVirtualKey] ?: 0 }
     val fxLoudness: Flow<Int> = context.dataStore.data.map { it[fxLoudnessKey] ?: 0 }
-    val fxReverb: Flow<Int> = context.dataStore.data.map { it[fxReverbKey] ?: -1 }
 
     suspend fun setFxBass(v: Int) { context.dataStore.edit { it[fxBassKey] = v.coerceIn(0, 1000) } }
-    suspend fun setFxVirtual(v: Int) { context.dataStore.edit { it[fxVirtualKey] = v.coerceIn(0, 1000) } }
     suspend fun setFxLoudness(v: Int) { context.dataStore.edit { it[fxLoudnessKey] = v.coerceIn(0, 1500) } }
-    suspend fun setFxReverb(v: Int) { context.dataStore.edit { it[fxReverbKey] = v.coerceIn(-1, 6) } }
-
-    /** 动态范围处理：0 关 / 1 轻 / 2 中 / 3 强 */
-    val fxDynamics: Flow<Int> = context.dataStore.data.map { it[fxDynamicsKey] ?: 0 }
-
-    suspend fun setFxDynamics(v: Int) { context.dataStore.edit { it[fxDynamicsKey] = v.coerceIn(0, 3) } }
 
     /**
      * 响度归一模式。

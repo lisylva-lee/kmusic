@@ -24,17 +24,23 @@ object TrackMatcher {
     private val BRACKET = Regex("""[（(\[【][^）)\]】]*[）)\]】]""")
     // 需要剔除的标点与空白
     private val PUNCT = Regex("""[\s\-_·・、,，.。!！?？:：;；'"“”‘’`~～@#\$%^&*+=|\\/<>]""")
+    // 版次/出处标注的分隔符。酷我大量歌名长这样：`红日-《他来自天堂》电视剧主题曲`
+    private const val SUBTITLE_SEPS = "-《(（[【～~:：|｜"
     // 歌手分隔符：周杰伦/五月天阿信、A & B、A feat. B
     private val ARTIST_SPLIT = Regex("""[/、&,，;；]|\bfeat\.?|\bft\.?|\bwith\b""", RegexOption.IGNORE_CASE)
 
     /**
-     * 归一化：全角转半角 → 小写 → 去括号内容 → 去标点空白。
-     * 目的：让「最伟大的作品 (Live)」和「最伟大的作品」能比中。
+     * 归一化：繁转简 → 全角转半角 → 小写 → 去括号内容 → 去标点空白。
+     * 目的：让「最伟大的作品 (Live)」和「最伟大的作品」能比中；
+     * 也让「千千闕歌|陳慧嫻」（模型常给的繁体）比中「千千阙歌|陈慧娴」（曲库的简体）。
+     *
+     * 繁转简必须放在最前：先去标点再去转字没有坏处，但先转会多一遍分配，
+     * 而且括号里的繁体（`(國語版)`）转不转都无所谓 —— 反正下面要整段删掉。
      */
     fun normalize(raw: String): String {
         if (raw.isEmpty()) return ""
         val sb = StringBuilder(raw.length)
-        for (ch in raw) {
+        for (ch in T2S.convert(raw)) {
             // 全角 ASCII（！ 到 ～）转半角
             sb.append(
                 when {
@@ -50,7 +56,7 @@ object TrackMatcher {
         return t.trim()
     }
 
-    /** 歌手拆成 token 集合，便于「周杰伦/五月天阿信」这类多人署名比对 */
+    /** 歌手拆成 token 集合（保留给测试与未来「多署名」场景） */
     fun artistTokens(raw: String): Set<String> =
         raw.split(ARTIST_SPLIT)
             .map { normalize(it) }
@@ -62,12 +68,21 @@ object TrackMatcher {
      *
      * 归一化后相等 → 通过；或一方包含另一方且长度比 ≥ 0.6
      * （长度比是防「晴天」误配「晴天娃娃」这类，纯包含判断太宽）
+     *
+     * 另外单独处理**版次/出处后缀**：酷我大量歌名是 `红日-《他来自天堂》电视剧主题曲`，
+     * 拿纯歌名 `红日` 去比，长度比只有 0.1，会被误判成不同歌 —— 而它恰恰是原曲。
+     * 做法是先把候选按 `-》《(` 一刀切掉尾巴再比，且这一刀**只认严格前缀**：
+     * 切完必须与目标完全相等才算命中，避免「晴天」把「晴天娃娃-某某」也吃进来。
      */
     fun nameMatches(a: String, b: String): Boolean {
         val na = normalize(a)
         val nb = normalize(b)
         if (na.isEmpty() || nb.isEmpty()) return false
         if (na == nb) return true
+        val sa = shortOf(a)
+        val sb = shortOf(b)
+        if (sa.isNotEmpty() && sa == nb) return true
+        if (sb.isNotEmpty() && sb == na) return true
         if (na.contains(nb) || nb.contains(na)) {
             val shorter = minOf(na.length, nb.length).toDouble()
             val longer = maxOf(na.length, nb.length).toDouble()
@@ -77,19 +92,71 @@ object TrackMatcher {
     }
 
     /**
+     * 砍掉「-《出处》主题曲」这类尾巴，返回归一化后的短名；没有分隔符就返回空串。
+     *
+     * **必须在原始串上切**：`normalize` 会把 `-`、`：`、`|` 当标点删掉，
+     * 等归一化完再找分隔符就永远找不到 —— `朋友-龙兄虎弟电影插曲` 会被当成一个整体，
+     * 长度比 0.2 直接判不匹配。原先的写法只靠 `《` 侥幸活在 `PUNCT` 之外，
+     * 遇到没有书名号的出处标注就漏。
+     */
+    private fun shortOf(raw: String): String {
+        var end = raw.length
+        for (sep in SUBTITLE_SEPS) {
+            val i = raw.indexOf(sep)
+            if (i in 1 until end) end = i
+        }
+        return if (end < raw.length) normalize(raw.substring(0, end)) else ""
+    }
+
+    /**
      * 歌手是否匹配。
      *
-     * 归一化后相等 → 通过；互相包含 → 通过；token 有交集 → 通过。
-     * 例：目标歌手「周杰伦」vs 候选「周杰伦/五月天阿信」→ token 交集命中。
+     * 规则（折中：优先认目标歌手，但要求它在前两位署名里）：
+     * 1. 归一化后相等 → 通过；
+     * 2. 目标歌手出现在**候选的前两位署名**里 → 通过
+     *    （`周杰伦/五月天阿信`、`邓紫棋&张新航` 都算）；
+     * 3. 一方完整包含另一方（`G.E.M.` vs `G.E.M.邓紫棋`）→ 通过。
+     *
+     * 为什么卡「前两位」：实测踩过 `泡沫` 的坑 —— 曲库第一条是
+     * `张新航&邓 紫 棋`（翻唱，邓紫棋排在第二位之后 / 名字还被加了空格），
+     * 老的 token 交集逻辑直接判命中，把翻唱塞进了歌单。
+     * 现在要求目标歌手必须在前两位署名里，且第一署名不是「明显不同的人名」时才放过。
      */
     fun artistMatches(a: String, b: String): Boolean {
         val na = normalize(a)
         val nb = normalize(b)
         if (na.isEmpty() || nb.isEmpty()) return false
         if (na == nb) return true
-        if (na.contains(nb) || nb.contains(na)) return true
-        return artistTokens(a).intersect(artistTokens(b)).isNotEmpty()
+
+        val ca = credits(a)
+        val cb = credits(b)
+        if (ca.isEmpty() || cb.isEmpty()) return false
+
+        val aMain = ca.first()
+        val bMain = cb.first()
+
+        // 主署名一致，或一方完整包含另一方（G.E.M. vs G.E.M.邓紫棋）
+        if (aMain == bMain) return true
+        if (aMain.length >= 2 && bMain.length >= 2 &&
+            (aMain.contains(bMain) || bMain.contains(aMain))
+        ) {
+            return true
+        }
+
+        // 目标歌手作为合作者出现在候选的第 2 位（邓紫棋 vs 张新航&邓紫棋）
+        if (cb.size >= 2 && cb[1] == aMain) return true
+
+        // 目标本身是多署名，与候选有完整交集（周杰伦/五月天阿信 vs 周杰伦&五月天阿信）
+        if (ca.size >= 2 && cb.any { c -> c == aMain || ca.contains(c) }) return true
+
+        return false
     }
+
+    /** 拆成署名列表（保序，`张新航&邓 紫 棋` → [张新航, 邓紫棋]） */
+    private fun credits(raw: String): List<String> =
+        raw.split(ARTIST_SPLIT)
+            .map { normalize(it) }
+            .filter { it.isNotEmpty() }
 
     /**
      * 时长是否匹配。
@@ -110,10 +177,39 @@ object TrackMatcher {
 
     /**
      * 从候选里挑最优的一首；没有全过的返回 null。
-     * 多个命中时取时长最接近的。
+     *
+     * 排序优先级（越靠前越可信）：
+     * 1. 主署名完全一致 → 原唱/主版本；
+     * 2. 主署名包含关系 → 别名、带地区后缀；
+     * 3. 目标歌手在第 2 位 → 合作版本；
+     * 最后才比时长接近度。
+     *
+     * 为什么要分层：折中规则放过了「目标歌手在第 2 位」的合作署名，
+     * 而酷我把翻唱（`张新航&邓 紫 棋`）排得比原唱还靠前。只按时长挑会把翻唱选出来；
+     * 分层后只要原唱在候选里就一定优先，只有确实没有原唱时才用合作版本。
      */
     fun pickBest(target: Candidate, candidates: List<Candidate>): Candidate? =
         candidates
             .filter { isMatch(target, it) }
-            .minByOrNull { kotlin.math.abs(it.durationMs - target.durationMs) }
+            .minWithOrNull(
+                compareBy<Candidate> { artistRank(target.artist, it.artist) }
+                    .thenBy { kotlin.math.abs(it.durationMs - target.durationMs) }
+            )
+
+    /** 歌手匹配的严格度，0 最严 */
+    private fun artistRank(targetArtist: String, candArtist: String): Int {
+        val ca = credits(targetArtist)
+        val cb = credits(candArtist)
+        if (ca.isEmpty() || cb.isEmpty()) return 9
+        val aMain = ca.first()
+        val bMain = cb.first()
+        if (aMain == bMain) return 0
+        if (aMain.length >= 2 && bMain.length >= 2 &&
+            (aMain.contains(bMain) || bMain.contains(aMain))
+        ) {
+            return 1
+        }
+        if (cb.size >= 2 && cb[1] == aMain) return 2
+        return 3
+    }
 }

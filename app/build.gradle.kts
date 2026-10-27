@@ -25,8 +25,8 @@ android {
         applicationId = "com.kmusic.apkhd"
         minSdk = 26
         targetSdk = 35
-        versionCode = 40
-        versionName = "2.3.0"
+        versionCode = 46
+        versionName = "2.3.3"
         multiDexEnabled = true
     }
 

@@ -141,27 +141,27 @@ fun ProfileScreen(
     eqBands: List<Int> = emptyList(),
     eqFreqs: List<Int> = emptyList(),
     eqRange: IntArray = intArrayOf(-1500, 1500),
+    /** 用户拖过滑块，曲线已不是预设 */
+    eqCustom: Boolean = false,
     onEqPresetChange: (Int) -> Unit = {},
     onEqBandChange: (Int, Int) -> Unit = { _, _ -> },
-    // 增强音效（低音/环绕/响度/混响）。全部 0 / -1 为关闭
+    // 增强音效（低音/响度）。0 为关闭
+    //
+    // v2.3.2：环绕、混响、动态范围已删除 —— 三项（均衡器/低音/响度）合并进
+    // 一个 DynamicsProcessing 实例，只占 1 个 effect 池位。
     fxBass: Int = 0,
     onFxBassChange: (Int) -> Unit = {},
-    fxVirtual: Int = 0,
-    onFxVirtualChange: (Int) -> Unit = {},
     fxLoudness: Int = 0,
     onFxLoudnessChange: (Int) -> Unit = {},
-    fxReverb: Int = -1,
-    onFxReverbChange: (Int) -> Unit = {},
     fxBassAvailable: Boolean = false,
-    fxVirtualAvailable: Boolean = false,
     fxLoudnessAvailable: Boolean = false,
-    fxReverbAvailable: Boolean = false,
     /** 有音效因 effect 池被占满而不可用（可重挂恢复） */
     fxStarved: Boolean = false,
     fxBassStarved: Boolean = false,
-    fxVirtualStarved: Boolean = false,
     fxLoudnessStarved: Boolean = false,
-    fxReverbStarved: Boolean = false,
+    /** 本 App 此刻实际占用的系统音效池位数 */
+    fxHeldCount: Int = 0,
+    fxWantedCount: Int = 0,
     onReattachFx: () -> Unit = {},
     sleepTotalMin: Int = 0,
     sleepRemainingSec: Int = 0,
@@ -190,12 +190,12 @@ fun ProfileScreen(
     var loudnessExpanded by remember { mutableStateOf(false) }
     var dsdRateExpanded by remember { mutableStateOf(false) }
     var eqExpanded by remember { mutableStateOf(false) }
+    // 均衡器详情区（预设 + 频段滑块）默认收起 —— 设置页以前滑块常驻，太长
+    var eqDetailOpen by remember { mutableStateOf(false) }
     // "endpoint" / "key" / "model" —— 非空时弹出输入框
     var aiEditing by remember { mutableStateOf<String?>(null) }
     var fxBassExpanded by remember { mutableStateOf(false) }
-    var fxVirtualExpanded by remember { mutableStateOf(false) }
     var fxLoudExpanded by remember { mutableStateOf(false) }
-    var fxReverbExpanded by remember { mutableStateOf(false) }
     var sleepExpanded by remember { mutableStateOf(false) }
 
     LazyColumn(
@@ -738,11 +738,16 @@ fun ProfileScreen(
                 onCheckedChange = onEqEnabledChange
             )
         }
-        if (eqEnabled && eqPresets.isNotEmpty()) {
+        // 预设行常显；只把 5 段滑块折起来 —— 滑块常驻时手指落在上面等于改曲线。
+        if (eqPresets.isNotEmpty()) {
             item {
                 SettingRow(
                     title = "预设",
-                    subtitle = eqPresets.getOrNull(eqPreset) ?: eqPresets.first(),
+                    subtitle = buildString {
+                        append(if (eqCustom) "自定义" else eqPresets.getOrNull(eqPreset) ?: "原声")
+                        if (!eqEnabled) append(" · 均衡器关闭中")
+                    },
+                    value = if (eqExpanded) "收起" else "展开",
                     onClick = { eqExpanded = !eqExpanded }
                 )
             }
@@ -756,23 +761,36 @@ fun ProfileScreen(
                 }
             }
         }
-        // 频段滑块：设备给几段画几段
+        // 频段滑块：设备给几段画几段。默认收起，展开后也只有手柄能拖。
         if (eqBands.isNotEmpty()) {
             item {
-                EqBandSliders(
-                    bands = eqBands,
-                    freqs = eqFreqs,
-                    range = eqRange,
-                    onBandChange = onEqBandChange
+                SettingRow(
+                    title = "频段调整",
+                    subtitle = buildString {
+                        append(if (eqCustom) "自定义" else eqPresets.getOrNull(eqPreset) ?: "原声")
+                        append(" · ${eqBands.size} 段")
+                    },
+                    value = if (eqDetailOpen) "收起" else "展开",
+                    onClick = { eqDetailOpen = !eqDetailOpen }
                 )
             }
-            item {
-                Text(
-                    text = "拖动滑块调整各频段增益；改动后不再跟随预设",
-                    color = moyinColors().t3,
-                    fontSize = 11.wsp,
-                    modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
-                )
+            if (eqDetailOpen) {
+                item {
+                    EqBandSliders(
+                        bands = eqBands,
+                        freqs = eqFreqs,
+                        range = eqRange,
+                        onBandChange = onEqBandChange
+                    )
+                }
+                item {
+                    Text(
+                        text = "拖动滑块调整各频段增益；改动后不再跟随预设。双击手柄可复位到 0 dB",
+                        color = moyinColors().t3,
+                        fontSize = 11.wsp,
+                        modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
+                    )
+                }
             }
         }
         }
@@ -790,9 +808,9 @@ fun ProfileScreen(
         }
 
         // ── 增强音效 ──
-        // 四项一律列出：不可用的灰掉并写明原因，不做「不支持就消失」——
+        // 两项一律列出：不可用的灰掉并写明原因，不做「不支持就消失」——
         // 消失会让人以为功能被砍，而且同一台机器上还会时有时无（effect 池满了）。
-        if (fxBassAvailable || fxVirtualAvailable || fxLoudnessAvailable || fxReverbAvailable || fxStarved) {
+        if (fxBassAvailable || fxLoudnessAvailable || fxStarved) {
             item { SectionHeader(text = "增强音效", modifier = Modifier.padding(top = 16.wdp)) }
 
             item {
@@ -809,24 +827,6 @@ fun ProfileScreen(
                         options = STRENGTH_STEPS,
                         selected = fxBass.toString(),
                         onPick = { onFxBassChange(it.toInt()); fxBassExpanded = false }
-                    )
-                }
-            }
-
-            item {
-                SettingRow(
-                    title = "环绕增强",
-                    subtitle = if (fxVirtualStarved) "资源占用，可重挂"
-                    else if (fxVirtualAvailable) strengthLabel(fxVirtual) else "本机不支持",
-                    onClick = { if (fxVirtualAvailable && !fxVirtualStarved) fxVirtualExpanded = !fxVirtualExpanded }
-                )
-            }
-            if (fxVirtualAvailable && fxVirtualExpanded) {
-                item {
-                    InlineOptions(
-                        options = STRENGTH_STEPS,
-                        selected = fxVirtual.toString(),
-                        onPick = { onFxVirtualChange(it.toInt()); fxVirtualExpanded = false }
                     )
                 }
             }
@@ -850,24 +850,6 @@ fun ProfileScreen(
                 }
             }
 
-            item {
-                SettingRow(
-                    title = "混响",
-                    subtitle = if (fxReverbStarved) "资源占用，可重挂"
-                    else if (fxReverbAvailable) reverbLabel(fxReverb) else "本机不支持",
-                    onClick = { if (fxReverbAvailable && !fxReverbStarved) fxReverbExpanded = !fxReverbExpanded }
-                )
-            }
-            if (fxReverbAvailable && fxReverbExpanded) {
-                item {
-                    InlineOptions(
-                        options = REVERB_STEPS,
-                        selected = fxReverb.toString(),
-                        onPick = { onFxReverbChange(it.toInt()); fxReverbExpanded = false }
-                    )
-                }
-            }
-
             if (fxStarved) {
                 item {
                     SettingRow(
@@ -876,6 +858,20 @@ fun ProfileScreen(
                         onClick = onReattachFx
                     )
                 }
+            }
+            item {
+                Text(
+                    text = when {
+                        fxHeldCount == 0 && fxWantedCount > 0 ->
+                            "当前占用 0 项系统音效资源（暂停中已暂时归还；按播放会重新申请）"
+                        fxHeldCount == 0 -> "当前占用 0 项系统音效资源（全部关闭，池位已归还系统）"
+                        else -> "当前占用 $fxHeldCount 项系统音效资源（关掉的项不占位）"
+                    },
+                    color = moyinColors().t3,
+                    fontSize = 11.wsp,
+                    lineHeight = 17.wsp,
+                    modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
+                )
             }
         }
 
@@ -1100,10 +1096,6 @@ private val STRENGTH_STEPS = listOf(
 private val LOUD_STEPS = listOf(
     "0" to "关", "300" to "+3 dB", "600" to "+6 dB", "900" to "+9 dB", "1200" to "+12 dB"
 )
-private val REVERB_STEPS = listOf(
-    "-1" to "关", "1" to "小房间", "2" to "中房间", "3" to "大房间",
-    "4" to "中厅", "5" to "大厅", "6" to "板式"
-)
 
 private fun strengthLabel(v: Int) = when {
     v <= 0 -> "关闭"
@@ -1113,7 +1105,6 @@ private fun strengthLabel(v: Int) = when {
     else -> "极强"
 }
 
-private fun reverbLabel(v: Int) = REVERB_STEPS.firstOrNull { it.first == v.toString() }?.second ?: "关闭"
 private val SLEEP_STEPS = listOf(
     "0" to "关闭", "15" to "15 分钟", "30" to "30 分钟",
     "45" to "45 分钟", "60" to "1 小时", "90" to "1.5 小时"

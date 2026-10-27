@@ -31,11 +31,7 @@ import java.util.concurrent.TimeUnit
  * Moonshot / 本地 vLLM 都能直接填地址。
  */
 class AiService(
-    private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        // 流式生成可能持续几十秒，读超时放宽；真正的卡死由界面取消兜底
-        .readTimeout(120, TimeUnit.SECONDS)
-        .build()
+    private val client: OkHttpClient = defaultClient()
 ) {
 
     data class Config(val endpoint: String, val apiKey: String, val model: String)
@@ -221,6 +217,31 @@ class AiService(
 
     companion object {
         /**
+         * 优先 IPv4 的 DNS。
+         *
+         * 踩过的坑：`gapi.5kk.cc.cd` 这类走 Cloudflare 的域名会同时返回 A 和 AAAA，
+         * 而宿主机只有内网 ULA（`fd17::`）、没有公网 IPv6 出口时，OkHttp 仍会先连
+         * 公网 AAAA（`2606:4700::`）→ 直接 `Failed to connect`，而 IPv4 明明是通的。
+         * 手机上「WiFi 有 IPv6 但实际出不去」的网络很常见。
+         *
+         * **只排序不够**：OkHttp 的连接失败重试会绕过我们给的顺序（实测仍然先连 AAAA）。
+         * 必须直接过滤掉 IPv6 —— 只有在完全没有 IPv4 结果时才退回 IPv6，
+         * 这样纯 IPv6 / NAT64 环境也还能用。
+         */
+        private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            // 流式生成可能持续几十秒，读超时放宽；真正的卡死由界面取消兜底
+            .readTimeout(120, TimeUnit.SECONDS)
+            .dns(object : okhttp3.Dns {
+                override fun lookup(hostname: String): List<java.net.InetAddress> {
+                    val all = okhttp3.Dns.SYSTEM.lookup(hostname)
+                    val v4 = all.filterIsInstance<java.net.Inet4Address>()
+                    return v4.ifEmpty { all }
+                }
+            })
+            .build()
+
+        /**
          * 提示词沿用「三个维度 + 禁止套话」的骨架：
          * 不给维度的模型会写成百度百科，给了维度才像乐评。
          */
@@ -231,6 +252,8 @@ class AiService(
             - 只推荐真实存在、广为人知的录音室版本
             - 避开 Live / 翻唱 / 伴奏 / DJ 版 / 纯音乐改编
             - 歌手写主要演唱者；多人合作只写前两位
+            - **歌名和歌手一律用简体中文**（曲库是简体；粤语/港台歌也要简体，例如写
+              「千千阙歌」「张国荣」，不要写「千千闕歌」「張國榮」）
             - 宁缺毋滥，不确定的不要写
         """.trimIndent()
 
@@ -272,6 +295,13 @@ class AiService(
             3. 【听觉与编曲亮点】：配器走向、旋律风格，或某个具体的听觉细节为什么动人。
             排版清晰，适合在手机播放器里沉浸阅读。
             不要复述歌词，不要出现「这首歌」「总之」这类空转句，直接进入内容。
+
+            排版约定（严格遵守，直接输出正文，不要加解释、不要用代码块包裹）：
+            - 第一行写一句话主旨，不超过 20 字，结尾不加标点。
+            - 空一行后，三个维度各用一行以「## 」开头的标题，如「## 创作背景与内核」。
+            - 每个标题下写 1~2 段正文，段与段之间空一行。
+            - 值得单独拎出来的原句，以「> 」开头单独成行，全篇最多两句。
+            - 不要使用表格、不要使用代码块。
         """.trimIndent()
     }
 }

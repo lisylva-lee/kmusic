@@ -1,12 +1,20 @@
 package com.kmusic.apkhd.ui.components
 
+import kotlin.math.abs
 import kotlin.math.roundToInt
+
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberUpdatedState
+import kotlinx.coroutines.delay
 
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.input.pointer.pointerInput
@@ -567,37 +575,63 @@ fun EqBandSliders(
     // （M3 Slider 的最小交互尺寸就是 48dp，比它窄还会被系统再压一次）。
     val travel = 190.wdp
 
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.wdp, vertical = 6.wdp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        bands.forEachIndexed { i, level ->
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.weight(1f)
-            ) {
-                Text(
-                    text = "%+.0f".format(level / 100f),
-                    color = if (level == 0) c.t3 else c.accent,
-                    fontSize = 11.wsp,
-                    fontWeight = if (level == 0) FontWeight.Normal else FontWeight.Medium
-                )
-                VerticalBandSlider(
-                    idx = i,
-                    level = level,
-                    lo = lo,
-                    hi = hi,
-                    height = travel,
-                    onChange = { onBandChange(i, it) }
-                )
-                Text(
-                    text = formatBandFreq(freqs.getOrNull(i) ?: 0),
-                    color = c.t3,
-                    fontSize = 9.wsp
-                )
+    // 拖动读数：拖的时候盖在这一排滑块顶上，松手后停留 1.2s 再消失。
+    var dragIdx by remember { mutableIntStateOf(-1) }
+    var dragLevel by remember { mutableIntStateOf(0) }
+    var dragActive by remember { mutableStateOf(false) }
+    var idleTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(dragActive, idleTick) {
+        if (!dragActive && dragIdx >= 0) {
+            delay(1200)
+            dragIdx = -1
+        }
+    }
+
+    Box {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.wdp, vertical = 6.wdp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            bands.forEachIndexed { i, level ->
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(
+                        text = "%+.0f".format(level / 100f),
+                        color = if (level == 0) c.t3 else c.accent,
+                        fontSize = 11.wsp,
+                        fontWeight = if (level == 0) FontWeight.Normal else FontWeight.Medium
+                    )
+                    VerticalBandSlider(
+                        idx = i,
+                        level = level,
+                        lo = lo,
+                        hi = hi,
+                        height = travel,
+                        onChange = { onBandChange(i, it) },
+                        onDrag = { _, v, active ->
+                            dragIdx = i
+                            dragLevel = v
+                            dragActive = active
+                            if (!active) idleTick++
+                        }
+                    )
+                    Text(
+                        text = formatBandFreq(freqs.getOrNull(i) ?: 0),
+                        color = c.t3,
+                        fontSize = 9.wsp
+                    )
+                }
+            }
+        }
+        if (dragIdx >= 0) {
+            // 贴着面板顶部居中，不挡手柄
+            Box(Modifier.align(Alignment.TopCenter)) {
+                EqReadoutChip(freqs.getOrNull(dragIdx) ?: 0, dragLevel)
             }
         }
     }
@@ -608,21 +642,17 @@ fun EqBandSliders(
  *
  * **为什么不用旋转的 Material Slider**（v2.2.3 换掉）：
  * 旋转方案有两个绕不过去的问题 ——
- * 1. 布局约束会把行程压扁（`width()` 顺从父 Box，得靠 `requiredWidth` 才顶得住），
- *    这个还能修；
+ * 1. 布局约束会把行程压扁（`width()` 顺从父 Box，得靠 `requiredWidth` 才顶得住）；
  * 2. **旋转之后 thumb 的命中区域和视觉位置对不上**。实测点击轨道 y=983（理论 +6dB）
- *    落到 +14dB，再点几次又完全不动 —— 因为 graphicsLayer 的旋转只改绘制，
- *    pointerInput 的坐标变换是另一套，两者在旋转 + 缩放（wdp/wsp）叠加时容易错位。
- *    这不是调参数能解决的，只能自己接管指针。
+ *    落到 +14dB。graphicsLayer 的旋转只改绘制，pointerInput 的坐标变换是另一套。
  *
- * 自绘版本把所有东西握在手里：
- * - 轨道高度就是行程，**从顶到底 = hi → lo 全量映射**，不做任何内缩；
- * - 拖拽/点击都走同一个 `pointerInput`，y 坐标直接换算成数值；
- * - **吸附到整 dB**（100mB）：手感上"每格 1dB"，正好对应界面显示的数字，
- *   不会出现"显示 +6 实际 +5.83"这种对不上的情况。
- *
- * 每 dB 的行程 = height / (hi-lo)，190dp 上 ±15dB 约 6.3dp/dB（≈9.5px@240dpi），
- * 比修之前的 1.2px 好 8 倍，手指能稳稳停在想要的刻度上。
+ * **为什么按下不再直接改值**（v2.3.2 二改）：
+ * 旧实现 `awaitFirstDown()` 之后立刻 `dragValue = valueAt(y)` —— 手指落在这一列任意位置
+ * 都会当场改曲线，而这一列 48dp 宽、190dp 高，5 列几乎铺满面板，面板又能上下滚。
+ * 想滚面板 → 手指落在滑块上 → 音效曲线被改，用户甚至不知道。
+ * 现在**只有按在手柄命中区（48×44dp）里才算抓到手柄**；没抓到就一个事件都不消费，
+ * 面板照常滚动。抓到之后事件全部 consume，面板不会跟着一起滚。
+ * 抓取时保留抓取偏移并随移动衰减，避免"一按手柄就跳 1.7dB"。
  */
 @Composable
 private fun VerticalBandSlider(
@@ -631,22 +661,26 @@ private fun VerticalBandSlider(
     lo: Float,
     hi: Float,
     height: Dp,
-    onChange: (Int) -> Unit
+    onChange: (Int) -> Unit,
+    onDrag: (Int, Int, Boolean) -> Unit = { _, _, _ -> }
 ) {
     val c = moyinColors()
     val span = (hi - lo).coerceAtLeast(1f)
-    val frac = ((level - lo) / span).coerceIn(0f, 1f)   // 0 = 底部(lo)，1 = 顶部(hi)
-
-    // 拖动中的当前值用本地 state 立刻反馈，松手后由外部 level 接管。
-    // 只依赖外部 level 的话，拖动时会有"跟不上手指"的滞后感。
     var dragging by remember { mutableStateOf(false) }
     var dragValue by remember { mutableFloatStateOf(level.toFloat()) }
+    // ⚠️ pointerInput 只以 (lo,hi,height) 为 key，闭包里直接读 `level` 会**永远读到首次组合的旧值**：
+    // 值改到 +14 后手柄已经移到顶部，命中判定却还按 +4 的位置算，于是「抓不到手柄 → 拖不动」。
+    // 用 rememberUpdatedState 把最新值带进手势闭包。
+    val latestLevel by rememberUpdatedState(level)
     val shown = if (dragging) dragValue else level.toFloat()
     val shownFrac = ((shown - lo) / span).coerceIn(0f, 1f)
 
     val trackW = 10.wdp
     val thumbH = 26.wdp
     val thumbW = 40.wdp
+    // 命中区比视觉手柄大一圈：手指按不准 26dp 高的圆角条
+    val hitHalfH = 22.wdp
+    val lastTap = remember { mutableLongStateOf(0L) }
 
     Box(
         modifier = Modifier
@@ -655,9 +689,9 @@ private fun VerticalBandSlider(
             // ⚠️ 只能有一个 pointerInput。之前 tap 和 drag 分成两个 pointerInput，
             // 两个协程同时从同一个 PointerInputScope 收事件、谁先返回谁吃掉 ——
             // 结果就是「点一下生效、再点就没反应」，日志里数值忽大忽小。
-            // 合并成一个 awaitEachGesture 后，按下/拖动/抬手都在同一个手势流里判定。
             .pointerInput(lo, hi, height) {
                 val total = size.height.toFloat().coerceAtLeast(1f)
+                val halfHitPx = hitHalfH.toPx()
                 fun valueAt(y: Float): Int {
                     val f = (1f - (y / total)).coerceIn(0f, 1f)   // 顶部 = hi
                     val raw = lo + f * span
@@ -665,27 +699,47 @@ private fun VerticalBandSlider(
                 }
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
+                    val curFrac = ((if (dragging) dragValue else latestLevel.toFloat()) - lo) / span
+                    val center = total * (1f - curFrac.coerceIn(0f, 1f))
+                    if (abs(down.position.y - center) > halfHitPx) {
+                        // 没抓到手柄：不消费、不改值，事件留给面板滚动
+                        return@awaitEachGesture
+                    }
                     dragging = true
-                    dragValue = valueAt(down.position.y).toFloat()
-                    onChange(dragValue.toInt())
-                    var moved = false
+                    dragValue = latestLevel.toFloat()
+                    onDrag(idx, latestLevel, true)
+                    var offset = down.position.y - center
+                    var maxDy = 0f
                     while (true) {
                         val ev = awaitPointerEvent()
                         val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
                         if (ch.pressed) {
-                            moved = true
-                            val v = valueAt(ch.position.y)
+                            maxDy = maxOf(maxDy, abs(ch.position.y - down.position.y))
+                            val v = valueAt(ch.position.y - offset)
+                            offset *= 0.82f   // 抓取偏移快速衰减 → 很快变成绝对跟随
                             if (v != dragValue.toInt()) {
                                 dragValue = v.toFloat()
                                 onChange(v)
                             }
+                            onDrag(idx, dragValue.toInt(), true)
                             ch.consume()
                         } else {
-                            if (!moved) onChange(valueAt(ch.position.y))
+                            ch.consume()
                             break
                         }
                     }
                     dragging = false
+                    if (maxDy <= viewConfiguration.touchSlop) {
+                        // 只是点了一下手柄：双击复位到 0 dB
+                        val now = System.currentTimeMillis()
+                        if (now - lastTap.longValue < 320L) {
+                            if (latestLevel != 0) onChange(0)
+                            lastTap.longValue = 0L
+                        } else {
+                            lastTap.longValue = now
+                        }
+                    }
+                    onDrag(idx, dragValue.toInt(), false)
                 }
             },
         contentAlignment = Alignment.Center
@@ -734,7 +788,7 @@ private fun VerticalBandSlider(
                 )
             }
         }
-        // thumb：跟手
+        // thumb：抓到手柄才跟手
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val total = maxHeight
             Box(
@@ -746,7 +800,7 @@ private fun VerticalBandSlider(
                     .clip(RoundedCornerShape(thumbH / 2))
                     .background(if (c.isDark) Color(0xFF2A2A2E) else Color.White)
                     .border(
-                        width = 2.wdp,
+                        width = if (dragging) 3.wdp else 2.wdp,
                         color = if (dragging) c.accent else c.t3.copy(alpha = 0.5f),
                         shape = RoundedCornerShape(thumbH / 2)
                     )
@@ -756,9 +810,36 @@ private fun VerticalBandSlider(
 }
 
 /**
+ * 频段拖动读数浮层：拖动时盖在整排滑块上方，显示「60Hz · +11 dB」。
+ *
+ * 为什么要有它：手指按在手柄上会把 11sp 的小数字盖住，光看手柄位置判断不出拖到哪；
+ * 而且 ±15dB 摊在 190dp 上，1dB ≈ 6.3dp，靠肉眼对位置本来就不准。
+ */
+@Composable
+private fun EqReadoutChip(freq: Int, level: Int) {
+    val c = moyinColors()
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(99.dp))
+            .background(if (c.isDark) Color(0xE61E1E22) else Color(0xF2FFFFFF))
+            .border(1.wdp, c.accent.copy(alpha = 0.45f), RoundedCornerShape(99.dp))
+            .padding(horizontal = 12.wdp, vertical = 6.wdp)
+    ) {
+        Text(
+            text = "${formatBandFreq(freq)} · %+.0f dB".format(level / 100f),
+            color = c.accent,
+            fontSize = 13.wsp,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+/**
  * 宽屏横向频段滑块：每频段一行 = 频率 │ 滑条 │ 增益值。
  *
  * 行程是竖排的 2 倍以上，配合 0dB 中位刻线，调 ±15dB 不用来回拖。
+ * 和竖排一样是**自绘 + 只认手柄**：Material Slider 默认「点轨道就跳值」，
+ * 在车机/平板上滚列表时同样会误改曲线，所以这里不用它。
  */
 @Composable
 private fun EqBandSlidersHorizontal(
@@ -769,56 +850,208 @@ private fun EqBandSlidersHorizontal(
     onBandChange: (Int, Int) -> Unit
 ) {
     val c = moyinColors()
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 18.wdp, vertical = 6.wdp),
-        verticalArrangement = Arrangement.spacedBy(2.wdp)
-    ) {
-        bands.forEachIndexed { i, level ->
-            val v = level.toFloat().coerceIn(lo, hi)
-            Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = formatBandFreq(freqs.getOrNull(i) ?: 0),
-                    color = c.t3,
-                    fontSize = 11.wsp,
-                    modifier = Modifier.width(52.wdp)
-                )
-                Box(
-                    Modifier
-                        .weight(1f)
-                        .height(40.wdp),
-                    contentAlignment = Alignment.Center
+    var dragIdx by remember { mutableIntStateOf(-1) }
+    var dragLevel by remember { mutableIntStateOf(0) }
+    var dragActive by remember { mutableStateOf(false) }
+    var idleTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(dragActive, idleTick) {
+        if (!dragActive && dragIdx >= 0) {
+            delay(1200)
+            dragIdx = -1
+        }
+    }
+
+    Box {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.wdp, vertical = 6.wdp),
+            verticalArrangement = Arrangement.spacedBy(2.wdp)
+        ) {
+            bands.forEachIndexed { i, level ->
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // 0dB 中位刻线：滑块在正中时正好压住它
-                    if (lo < 0 && hi > 0) {
-                        val center = (0f - lo) / (hi - lo)
-                        Box(
-                            Modifier
-                                .fillMaxHeight()
-                                .width(1.wdp)
-                                .align(Alignment.CenterStart)
-                                .graphicsLayer { translationX = (size.width - 1.dp.toPx()) * center }
-                                .background(c.t3.copy(alpha = 0.28f))
-                        )
-                    }
-                    Slider(
-                        value = v,
-                        onValueChange = { onBandChange(i, it.toInt()) },
-                        valueRange = lo..hi,
-                        modifier = Modifier.fillMaxWidth()
+                    Text(
+                        text = formatBandFreq(freqs.getOrNull(i) ?: 0),
+                        color = c.t3,
+                        fontSize = 11.wsp,
+                        modifier = Modifier.width(52.wdp)
+                    )
+                    HorizontalBandSlider(
+                        idx = i,
+                        level = level,
+                        lo = lo,
+                        hi = hi,
+                        onChange = { v -> onBandChange(i, v) },
+                        onDrag = { _, v, active ->
+                            dragIdx = i; dragLevel = v; dragActive = active
+                            if (!active) idleTick++
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        text = "%+.0f dB".format(level / 100f),
+                        color = if (level == 0) c.t3 else c.accent,
+                        fontSize = 11.wsp,
+                        modifier = Modifier.width(56.wdp)
                     )
                 }
-                Text(
-                    text = "%+.0f dB".format(level / 100f),
-                    color = if (level == 0) c.t3 else c.accent,
-                    fontSize = 11.wsp,
-                    modifier = Modifier.width(56.wdp)
+            }
+        }
+        if (dragIdx >= 0) {
+            Box(Modifier.align(Alignment.TopCenter)) {
+                EqReadoutChip(freqs.getOrNull(dragIdx) ?: 0, dragLevel)
+            }
+        }
+    }
+}
+
+/**
+ * 宽屏横向自绘滑块：40dp 高的可触区，轨道 6dp，手柄 26×34dp。
+ * 只认手柄（横向命中区 ±22dp），点轨道不改值。
+ */
+@Composable
+private fun HorizontalBandSlider(
+    idx: Int,
+    level: Int,
+    lo: Float,
+    hi: Float,
+    onChange: (Int) -> Unit,
+    onDrag: (Int, Int, Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val c = moyinColors()
+    val span = (hi - lo).coerceAtLeast(1f)
+    var dragging by remember { mutableStateOf(false) }
+    var dragValue by remember { mutableFloatStateOf(level.toFloat()) }
+    // 同竖排：pointerInput 的 key 不含 level，必须用 rememberUpdatedState 才能拿到最新值
+    val latestLevel by rememberUpdatedState(level)
+    val shownFrac = (((if (dragging) dragValue else level.toFloat()) - lo) / span).coerceIn(0f, 1f)
+    val trackH = 6.wdp
+    val thumbW = 26.wdp
+    val thumbH = 34.wdp
+    val hitHalfW = 22.wdp
+    val lastTap = remember { mutableLongStateOf(0L) }
+
+    Box(
+        modifier = modifier
+            .height(44.wdp)
+            .pointerInput(lo, hi) {
+                val total = size.width.toFloat().coerceAtLeast(1f)
+                val halfHitPx = hitHalfW.toPx()
+                fun valueAt(x: Float): Int {
+                    val f = (x / total).coerceIn(0f, 1f)
+                    val raw = lo + f * span
+                    return ((raw / 100f).roundToInt() * 100).coerceIn(lo.toInt(), hi.toInt())
+                }
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val curFrac = (((if (dragging) dragValue else latestLevel.toFloat()) - lo) / span)
+                        .coerceIn(0f, 1f)
+                    val center = total * curFrac
+                    if (abs(down.position.x - center) > halfHitPx) return@awaitEachGesture
+
+                    // 方向锁：面板是纵向滚动的，手指从手柄上起手往上下滑，是在滚面板
+                    // 而不是调频段（实测过：滚面板时 14k 被蹭成 +3dB）。
+                    // 这里先不动值，等第一次移动方向确定 —— 横向为主才算抓到手柄。
+                    var dx = 0f
+                    var dy = 0f
+                    while (abs(dx) <= viewConfiguration.touchSlop &&
+                        abs(dy) <= viewConfiguration.touchSlop
+                    ) {
+                        val ev = awaitPointerEvent()
+                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: return@awaitEachGesture
+                        if (!ch.pressed) {
+                            // 没移动就抬手 = 点了一下手柄：双击复位 0 dB
+                            val now = System.currentTimeMillis()
+                            if (now - lastTap.longValue < 320L) {
+                                if (latestLevel != 0) onChange(0)
+                                lastTap.longValue = 0L
+                            } else {
+                                lastTap.longValue = now
+                            }
+                            return@awaitEachGesture
+                        }
+                        dx = ch.position.x - down.position.x
+                        dy = ch.position.y - down.position.y
+                    }
+                    if (abs(dy) >= abs(dx)) return@awaitEachGesture
+
+                    dragging = true
+                    dragValue = latestLevel.toFloat()
+                    onDrag(idx, latestLevel, true)
+                    var offset = dx
+                    var maxDx = 0f
+                    while (true) {
+                        val ev = awaitPointerEvent()
+                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                        if (ch.pressed) {
+                            maxDx = maxOf(maxDx, abs(ch.position.x - down.position.x))
+                            val v = valueAt(ch.position.x - offset)
+                            offset *= 0.82f
+                            if (v != dragValue.toInt()) {
+                                dragValue = v.toFloat()
+                                onChange(v)
+                            }
+                            onDrag(idx, dragValue.toInt(), true)
+                            ch.consume()
+                        } else {
+                            ch.consume()
+                            break
+                        }
+                    }
+                    dragging = false
+                    if (maxDx <= viewConfiguration.touchSlop) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastTap.longValue < 320L) {
+                            if (latestLevel != 0) onChange(0)
+                            lastTap.longValue = 0L
+                        } else {
+                            lastTap.longValue = now
+                        }
+                    }
+                    onDrag(idx, dragValue.toInt(), false)
+                }
+            },
+        contentAlignment = Alignment.CenterStart
+    ) {
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val total = maxWidth
+            Box(
+                Modifier
+                    .align(Alignment.CenterStart)
+                    .fillMaxWidth()
+                    .height(trackH)
+                    .clip(RoundedCornerShape(trackH / 2))
+                    .background(c.t3.copy(alpha = 0.16f))
+            )
+            if (lo < 0 && hi > 0) {
+                val zeroFrac = ((0f - lo) / span).coerceIn(0f, 1f)
+                Box(
+                    Modifier
+                        .align(Alignment.CenterStart)
+                        .offset(x = total * zeroFrac - 0.5.dp)
+                        .width(1.wdp)
+                        .height(18.wdp)
+                        .background(c.t3.copy(alpha = 0.45f))
                 )
             }
+            Box(
+                Modifier
+                    .align(Alignment.CenterStart)
+                    .offset(x = total * shownFrac - thumbW / 2)
+                    .width(thumbW)
+                    .height(thumbH)
+                    .clip(RoundedCornerShape(thumbH / 3))
+                    .background(if (c.isDark) Color(0xFF2A2A2E) else Color.White)
+                    .border(
+                        width = if (dragging) 3.wdp else 2.wdp,
+                        color = if (dragging) c.accent else c.t3.copy(alpha = 0.5f),
+                        shape = RoundedCornerShape(thumbH / 3)
+                    )
+            )
         }
     }
 }
@@ -841,5 +1074,3 @@ internal fun formatBandFreq(hz: Int): String = when {
     }
     else -> "$hz"
 }
-
-

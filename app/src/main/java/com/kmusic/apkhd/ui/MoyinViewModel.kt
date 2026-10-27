@@ -618,9 +618,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 // 只在 playTrack 里清会出现「换歌了但还显示上一首赏析」。
                 if (lastAiTrackId != t.id) {
                     lastAiTrackId = t.id
-                    cancelAiGuide()
-                    aiText = ""
-                    aiError = null
+                    resetAiForTrackChange()
                     // 译文跟着歌走：上一首的译文挂到新歌下面比没有更糟
                     lyricTranslation = emptyMap()
                     translating = false
@@ -2027,10 +2025,9 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun playLoop(start: Int) {
         queue.getOrNull(start)?.let { tapped ->
             playbackState = playbackState.copy(track = tapped, buffering = true, error = null)
-            // 切歌就掐掉上一首的导赏请求，否则它会把内容追加到新歌的文本框里
-            cancelAiGuide()
-            aiText = ""
-            aiError = null
+            // 切歌就掐掉上一首的导赏请求，否则它会把内容追加到新歌的文本框里。
+            // resetAiForTrackChange 会先把上一首的半篇存档（归到旧歌名下）再清屏。
+            resetAiForTrackChange()
             loadLyrics(tapped)
             queueBuildJob?.cancel()
         }
@@ -2810,7 +2807,16 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     // 不做「内置 key」：那是拿我们的钱替所有人付账，而且 key 泄漏就废了。
 
     private val aiService = AiService()
-    private val aiCache = HashMap<String, String>()   // trackId -> 导赏全文（内存，进程内有效）
+    /**
+     * trackId -> 导赏全文。
+     *
+     * 内存 + 磁盘两层：内存管本次进程内的来回切歌，磁盘管杀进程重进 ——
+     * 导赏是按 token 计费的，用户切走再回来不该重付一次。
+     * 落盘在 [GuideStore]，只在**流正常结束**或**用户主动停止**时写，
+     * 请求失败（网络/额度）不缓存，否则重试会直接拿到半截空文。
+     */
+    private val aiCache = HashMap<String, String>()
+    private val aiStore by lazy { com.kmusic.apkhd.data.GuideStore(getApplication()) }
 
     var aiEndpoint by mutableStateOf("https://api.deepseek.com/v1")
         private set
@@ -2829,7 +2835,19 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     var aiError by mutableStateOf<String?>(null)
         private set
 
+    /**
+     * 当前这篇导赏是否**已经写完**。
+     *
+     * 用户中途点「停止」或关掉面板时也是 [aiText] 非空、[aiLoading] 为 false，
+     * 光看这两个状态分不出「写完了」和「只写了一半」。界面据此决定
+     * 显示「已生成」还是「已停止（可继续）」。
+     */
+    var aiComplete by mutableStateOf(false)
+        private set
+
     private var aiJob: Job? = null
+    /** 当前 [aiText] 属于哪首歌 —— 切歌那一刻 playbackState.track 已经是新歌了，不能拿它当归属 */
+    private var aiTrackId: String? = null
     /** 上一次触发过导赏清零的曲目 id，避免同一首重播时反复清空 */
     private var lastAiTrackId: String? = null
 
@@ -2845,38 +2863,122 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun requestAiGuide() {
         val t = playbackState.track ?: return
-        aiCache[t.id]?.let {
-            aiText = it
-            aiError = null
-            aiLoading = false
-            return
-        }
         aiJob?.cancel()
-        aiText = ""
-        aiError = null
-        aiLoading = true
-        aiJob = viewModelScope.launch {
-            try {
-                val lyricText = lyrics?.joinToString("\n") { it.text }.orEmpty()
-                aiService.analyze(
-                    AiService.Config(aiEndpoint, aiApiKey, aiModel),
-                    t.name, t.artist, lyricText
-                ).collect { delta -> aiText += delta }
-                if (aiText.isNotBlank()) aiCache[t.id] = aiText
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                aiError = e.message ?: "请求失败"
-            } finally {
-                aiLoading = false
-            }
+        aiJob = viewModelScope.launch { runAiGuide(t) }
+    }
+
+    /**
+     * 打开详情面板时调一次：把已经生成过的导赏读出来，**不发起任何网络请求**。
+     *
+     * 不这么做的话，用户生成完、关掉面板、再打开，看到的是空态和「生成导赏」按钮 ——
+     * 他会以为内容丢了，而且不敢再点（怕又扣一次钱）。
+     */
+    fun loadCachedAiGuide() {
+        val t = playbackState.track ?: return
+        if (aiText.isNotBlank() && aiTrackId == t.id) return   // 已在屏上
+        if (aiLoading) return                                   // 正在生成，别抢
+        viewModelScope.launch {
+            val cached = aiCache[t.id] ?: aiStore.read(t.id)?.also { aiCache[t.id] = it }
+            if (cached == null) return@launch
+            // 期间可能已经切歌/开始新生成，落盘读是挂起的，回来要二次确认
+            if (playbackState.track?.id != t.id || aiLoading) return@launch
+            aiText = cached
+            aiError = null
+            aiComplete = aiStore.isComplete(t.id)
+            aiTrackId = t.id
         }
     }
 
+    private suspend fun runAiGuide(t: Track) {
+        // 先看内存，再看磁盘（磁盘命中顺手回填内存）——
+        // 同一首歌重复点「生成」不该二次计费。
+        //
+        // 但**只有写完过的那篇才算命中**：半篇（用户上次点过停止）如果也短路返回，
+        // 点「继续生成」就会一直卡在原地毫无反应 —— 那比丢内容更让人困惑。
+        val cached = aiCache[t.id] ?: aiStore.read(t.id)?.also { aiCache[t.id] = it }
+        if (cached != null && aiStore.isComplete(t.id)) {
+            aiText = cached
+            aiError = null
+            aiLoading = false
+            aiComplete = true
+            aiTrackId = t.id
+            return
+        }
+        // 注意：这里**不能**再 cancel aiJob —— runAiGuide 本身就跑在 aiJob 里，
+        // 取消它等于取消自己：请求还没发出就被 CancellationException 打断，
+        // 界面表现为「点了生成完全没反应」。上一次请求的取消在 requestAiGuide 里做。
+        aiText = ""
+        aiError = null
+        aiComplete = false
+        aiLoading = true
+        aiTrackId = t.id
+        try {
+            val lyricText = lyrics?.joinToString("\n") { it.text }.orEmpty()
+            aiService.analyze(
+                AiService.Config(aiEndpoint, aiApiKey, aiModel),
+                t.name, t.artist, lyricText
+            ).collect { delta -> aiText += delta }
+            aiComplete = true
+            if (aiText.isNotBlank()) {
+                aiCache[t.id] = aiText
+                aiStore.write(t.id, aiText)
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // 停止/关面板：**已经生成的部分要保住**，否则用户花了 token 却什么都没留下。
+            // 存成「未完成」，下次打开能直接续读，而不是从头再买一遍。
+            savePartialAi()
+            throw e
+        } catch (e: Exception) {
+            aiError = e.message ?: "请求失败"
+            // 失败不缓存：半截或空内容存下来，重试会直接命中缓存拿到坏结果
+        } finally {
+            aiLoading = false
+        }
+    }
+
+    /**
+     * 用户主动停止生成。
+     *
+     * 和切歌时的取消不同：这里要**保留**已经生成的内容（用户看得见它，突然清空像丢数据）。
+     * 真正的清空发生在切到别的歌时（见 [onTrackChanged] 附近的 aiText = ""）。
+     */
     fun cancelAiGuide() {
         aiJob?.cancel()
         aiJob = null
         aiLoading = false
+        aiComplete = false
+        savePartialAi()
+    }
+
+    /**
+     * 把当前已生成的部分存到**它所属的那首歌**名下（不是当前播放的歌）。
+     *
+     * 同步进内存、异步落盘：调用点在主线程（点停止、切歌），DataStore 写要几十毫秒，
+     * 不能卡住 UI。先取快照再 launch，避免协程跑起来时 [aiText] 已经被清空。
+     */
+    private fun savePartialAi() {
+        val id = aiTrackId ?: return
+        val partial = aiText.trim()
+        if (partial.isEmpty()) return
+        aiCache[id] = partial
+        viewModelScope.launch { aiStore.write(id, partial, complete = false) }
+    }
+
+    /**
+     * 切歌：先把上一首已生成的部分存到**它自己名下**，再清屏。
+     *
+     * 用户在 A 歌看到一半换到 B，A 的半篇不该白费 —— 回到 A 时还能接着读。
+     * 这里必须用 [aiTrackId]（A）而不是 playbackState.track（已经是 B 了）。
+     */
+    private fun resetAiForTrackChange() {
+        savePartialAi()
+        aiJob?.cancel()
+        aiJob = null
+        aiLoading = false
+        aiText = ""
+        aiError = null
+        aiComplete = false
+        aiTrackId = null
     }
 
     // ---------------- AI 建歌单 ----------------
@@ -2956,7 +3058,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                     found += r.filterNotNull()
                 }
                 if (found.size < 3) {
-                    aiGenError = "你要 $want 首，AI 给了 ${picks.size} 首，其中只有 ${found.size} 首能播"
+                    // 说清楚卡在哪一步：是模型给的数量少，还是曲库没收录。
+                    // 老文案「只有 0 首能播」用户无从下手 —— 既像 AI 坏了，又像网络坏了。
+                    aiGenError = if (found.isEmpty()) {
+                        "曲库没搜到 AI 推荐的这 ${picks.size} 首（多是版本/译名对不上），换个说法再试"
+                    } else {
+                        "AI 给了 ${picks.size} 首，曲库只收录了 ${found.size} 首（至少要 3 首才建）"
+                    }
                     return@launch
                 }
 
@@ -3038,14 +3146,46 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         return 12
     }
 
+    /**
+     * 按「歌名 + 歌手」在酷我找一首真能播的。
+     *
+     * 复用跨源回退用的 TrackMatcher（歌名归一化 + 歌手 token 比对，含繁简互转），
+     * 宁可返回 null 也不肯凑一首同名不同人的歌 —— 歌单里串歌比少一首糟糕得多。
+     *
+     * 以前用 `runCatching{}.getOrDefault(emptyList())` 把异常全吞了：曲库挂了、被限流、
+     * DNS 失败，界面一律显示「0 首能播」，把网络问题伪装成模型问题。现在照旧不抛出
+     * （单首失败不该毁掉整个歌单），但**一定打日志**，方便下次直接从 logcat 定位。
+     */
     private suspend fun findTrackByName(name: String, artist: String): Track? {
-        val hits = runCatching {
-            client.search("$name $artist".trim(), size = 5)
-        }.getOrDefault(emptyList())
+        val kw = "$name $artist".trim()
+        val hits = try {
+            client.search(kw, size = 5)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DiagLog.log("AI_PLAYLIST", "搜索失败「$kw」 ${e.javaClass.simpleName}: ${e.message}")
+            return null
+        }
+        if (hits.isEmpty()) {
+            DiagLog.log("AI_PLAYLIST", "搜索 0 条「$kw」")
+            return null
+        }
         val hit = hits.firstOrNull { r ->
             TrackMatcher.nameMatches(name, r.name ?: "") &&
                 (artist.isBlank() || TrackMatcher.artistMatches(artist, r.artist ?: ""))
-        } ?: return null
+        }
+        if (hit == null) {
+            val sim = com.kmusic.apkhd.net.T2S.convert(name)
+            DiagLog.log(
+                "AI_PLAYLIST",
+                "曲库没收录「$kw」" +
+                    (if (sim != name) "（原文含繁体，简体为「$sim」）" else "") +
+                    "，前 3 候选：" + hits.take(3).joinToString(" / ") {
+                        "${it.name ?: "?"}·${it.artist ?: "?"}"
+                    }
+            )
+            return null
+        }
         return hit.toTrack()
     }
 
@@ -3301,9 +3441,17 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var eqPreset by mutableStateOf(0)
         private set
-    /** 设备实际支持的预设。要等播放器建出 audio session 才有内容 */
-    var eqPresets by mutableStateOf<List<String>>(emptyList())
+    /**
+     * 均衡器预设名。
+     *
+     * v2.3.2 起是**内置表**（7 套），不再读设备 —— 合并进 DynamicsProcessing 后
+     * 没有芯片原厂的 usePreset() 可用，所以列表一开机就有内容，不用等 audio session。
+     */
+    var eqPresets by mutableStateOf(AudioEffectHolder.presetNames())
         private set
+
+    /** 本进程是否已做过「设备预设 → 内置预设」的迁移（只做一次） */
+    private var presetMigrated = false
 
     /** 设备是否真的挂了均衡器 —— 没挂就别摆开关，点了不动比不显示更糟 */
     var eqAvailable by mutableStateOf(false)
@@ -3339,6 +3487,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     fun changeEqEnabled(on: Boolean) {
         eqEnabled = on
         AudioEffectHolder.configure(on, eqPreset)
+        AudioEffectHolder.onUserEdited()
         refreshEqPresets()
         viewModelScope.launch { settings.setEqEnabled(on) }
     }
@@ -3346,9 +3495,15 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     fun changeEqPreset(index: Int) {
         eqPreset = index
         eqCustom = false
-        AudioEffectHolder.configure(eqEnabled, index)
+        // 选预设隐含「我要用均衡器」：关着选预设没有任何听感变化，用户会以为坏了。
+        eqEnabled = true
+        AudioEffectHolder.usePresetMode(index)
+        AudioEffectHolder.onUserEdited()
         refreshEqBands()
-        viewModelScope.launch { settings.setEqPreset(index) }
+        viewModelScope.launch {
+            settings.setEqPreset(index)
+            settings.setEqEnabled(true)
+        }
     }
 
     /**
@@ -3361,6 +3516,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         // 且这个页面 dump 会因 U+0 崩），打一行日志当验收锚点。
         DiagLog.log("EQ", "频段 $band → ${levelMiliBel / 100} dB")
         AudioEffectHolder.setBandLevel(band, levelMiliBel)
+        AudioEffectHolder.onUserEdited()
         eqEnabled = true
         eqCustom = true
         eqBands = AudioEffectHolder.bandLevels().toList()
@@ -3410,25 +3566,17 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------------- 增强音效（低音/环绕/响度/混响） ----------------
+    // ---------------- 增强音效（低音/响度） ----------------
+    //
+    // v2.3.2：环绕、混响、动态范围已删除。三项（均衡器/低音/响度）合并进
+    // 一个 DynamicsProcessing 实例，只占 1 个 effect 池位。删掉的三项在
+    // 部分 ROM 上根本建不出来（真机日志里混响 377 次失败），留着只会白饿死别的项。
 
     /** 0..1000，0 = 关 */
     var fxBass by mutableStateOf(0)
         private set
-    /** 0..1000，0 = 关 */
-    var fxVirtual by mutableStateOf(0)
-        private set
     /** 0..1500 mB，0 = 关 */
     var fxLoudness by mutableStateOf(0)
-        private set
-    /** -1 = 关，0..6 = 混响预设 */
-    var fxReverb by mutableStateOf(-1)
-        private set
-
-    /** 动态范围处理：0 关 / 1 轻 / 2 中 / 3 强 */
-    var fxDynamics by mutableStateOf(0)
-        private set
-    var fxDynamicsAvailable by mutableStateOf(false)
         private set
 
     /** 省电播放（offload）：开了音效链就不可用 */
@@ -3454,11 +3602,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     /** 设备到底支不支持某一项 —— 界面据此隐藏，不做假开关 */
     var fxBassAvailable by mutableStateOf(false)
         private set
-    var fxVirtualAvailable by mutableStateOf(false)
-        private set
     var fxLoudnessAvailable by mutableStateOf(false)
-        private set
-    var fxReverbAvailable by mutableStateOf(false)
         private set
     /** 有音效项因 effect 池被占满而不可用（可重挂恢复） */
     var fxStarved by mutableStateOf(false)
@@ -3468,28 +3612,33 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var fxBassStarved by mutableStateOf(false)
         private set
-    var fxVirtualStarved by mutableStateOf(false)
-        private set
     var fxLoudnessStarved by mutableStateOf(false)
         private set
-    var fxReverbStarved by mutableStateOf(false)
-        private set
-    var fxDynamicsStarved by mutableStateOf(false)
+
+    /**
+     * 本 App 此刻实际占用几个系统音效池位。
+     *
+     * 面板上直接写出来：用户才算得清「关掉的项确实没在占地方」。
+     * 全关时是 0，开一项加 1。
+     */
+    var fxHeldCount by mutableStateOf(0)
+
+    /**
+     * 用户配置里开着的音效项数（和 fxHeldCount 不同：暂停 15 秒归还池位后
+     * 这个数仍 > 0 —— 界面靠它区分「本来就没开」和「暂停中暂时归还」）。
+     */
+    var fxWantedCount by mutableStateOf(0)
         private set
 
     /** 音效链挂上之后刷新可用性 —— 和 refreshEqPresets 一起调 */
     fun refreshFxAvailability() {
+        fxHeldCount = AudioEffectHolder.heldCount
+        fxWantedCount = AudioEffectHolder.wantedCount
         fxBassAvailable = AudioEffectHolder.bassAvailable
-        fxVirtualAvailable = AudioEffectHolder.virtualAvailable
         fxLoudnessAvailable = AudioEffectHolder.loudnessAvailable
-        fxReverbAvailable = AudioEffectHolder.reverbAvailable
-        fxDynamicsAvailable = AudioEffectHolder.dynamicsAvailable
         eqStarved = AudioEffectHolder.eqStarved
         fxBassStarved = AudioEffectHolder.bassStarved
-        fxVirtualStarved = AudioEffectHolder.virtualStarved
         fxLoudnessStarved = AudioEffectHolder.loudnessStarved
-        fxReverbStarved = AudioEffectHolder.reverbStarved
-        fxDynamicsStarved = AudioEffectHolder.dynamicsStarved
         fxStarved = AudioEffectHolder.starvedTypes.isNotEmpty()
     }
 
@@ -3499,12 +3648,6 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         refreshFxAvailability()
         pushFx()
         toast(if (ok) "音效链已重挂" else "重挂失败，请重启 App")
-    }
-
-    fun changeFxDynamics(level: Int) {
-        fxDynamics = level.coerceIn(0, 3)
-        AudioEffectHolder.configureDynamics(fxDynamics)
-        viewModelScope.launch { settings.setFxDynamics(fxDynamics) }
     }
 
     /**
@@ -3547,31 +3690,25 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun pushFx() {
-        AudioEffectHolder.configureEnhanced(fxBass, fxVirtual, fxLoudness, fxReverb)
+        AudioEffectHolder.configureEnhanced(fxBass, fxLoudness)
+    }
+
+    /** 用户主动改音效（开关/强度/档位）—— 建完还要通知服务重排释放计时 */
+    private fun pushFxUser() {
+        pushFx()
+        AudioEffectHolder.onUserEdited()
     }
 
     fun changeFxBass(v: Int) {
         fxBass = v.coerceIn(0, 1000)
-        pushFx()
+        pushFxUser()
         viewModelScope.launch { settings.setFxBass(fxBass) }
-    }
-
-    fun changeFxVirtual(v: Int) {
-        fxVirtual = v.coerceIn(0, 1000)
-        pushFx()
-        viewModelScope.launch { settings.setFxVirtual(fxVirtual) }
     }
 
     fun changeFxLoudness(v: Int) {
         fxLoudness = v.coerceIn(0, 1500)
-        pushFx()
+        pushFxUser()
         viewModelScope.launch { settings.setFxLoudness(fxLoudness) }
-    }
-
-    fun changeFxReverb(v: Int) {
-        fxReverb = v.coerceIn(-1, 6)
-        pushFx()
-        viewModelScope.launch { settings.setFxReverb(fxReverb) }
     }
 
     // ---------------- 搜索增强 ----------------
@@ -4372,11 +4509,24 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { settings.aiApiKey.collect { aiApiKey = it } }
         viewModelScope.launch { settings.aiModel.collect { aiModel = it } }
         viewModelScope.launch { settings.eqEnabled.collect { eqEnabled = it; AudioEffectHolder.configure(it, eqPreset) } }
-        viewModelScope.launch { settings.eqPreset.collect { eqPreset = it; AudioEffectHolder.configure(eqEnabled, it) } }
+        viewModelScope.launch {
+            settings.eqPreset.collect { raw ->
+                // 老版本存的是**设备预设下标**（0..9），现在换成 7 套内置表。
+                // 只在本次进程第一次读到旧值时迁移一次，之后不再动用户的选择。
+                val idx = if (presetMigrated) raw else {
+                    presetMigrated = true
+                    AudioEffectHolder.migratePresetIndex(raw).also { m ->
+                        eqPreset = m
+                        if (m != raw) viewModelScope.launch { settings.setEqPreset(m) }
+                    }
+                }
+                eqPreset = idx
+                AudioEffectHolder.configure(eqEnabled, idx)
+                refreshEqBands()
+            }
+        }
         viewModelScope.launch { settings.fxBass.collect { fxBass = it; pushFx() } }
-        viewModelScope.launch { settings.fxVirtual.collect { fxVirtual = it; pushFx() } }
         viewModelScope.launch { settings.fxLoudness.collect { fxLoudness = it; pushFx() } }
-        viewModelScope.launch { settings.fxReverb.collect { fxReverb = it; pushFx() } }
         // 音效链真正建出来的时刻只有 Service 知道 —— 跟着版本号刷新可用性和预设
         viewModelScope.launch {
             snapshotFlow { AudioEffectHolder.sessionVersion }.collect { v ->
@@ -4390,6 +4540,15 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         // 失败只刷新界面状态，**不能**再 pushFx：
         // pushFx 会去重建效果 → 又失败 → 又刷新，一秒能滚出几千轮，CPU 烧到 100%。
         // （sessionVersion 那条路有 pushFx，所以失败时绝对不能碰它。）
+        // 池位占用变化：面板上那个「本机占用 N 项」跟着动
+        viewModelScope.launch {
+            snapshotFlow { AudioEffectHolder.poolTick }.collect { v ->
+                if (v > 0) {
+                    fxHeldCount = AudioEffectHolder.heldCount
+                    fxWantedCount = AudioEffectHolder.wantedCount
+                }
+            }
+        }
         viewModelScope.launch {
             snapshotFlow { AudioEffectHolder.effectFailedTick }.collect { v ->
                 if (v > 0) refreshFxAvailability()
@@ -4415,12 +4574,6 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                     loudnessMode = m
                     playbackState.track?.let { applyLoudness(it) }
                 }
-            }
-        }
-        viewModelScope.launch {
-            settings.fxDynamics.collect { lvl ->
-                fxDynamics = lvl
-                AudioEffectHolder.configureDynamics(lvl)
             }
         }
         viewModelScope.launch { settings.audioOffload.collect { audioOffload = it } }

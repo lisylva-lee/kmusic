@@ -27,6 +27,82 @@ class TrackMatcherTest {
         assertEquals("说好不哭", TrackMatcher.normalize("说好不哭 【DJ版】"))
     }
 
+    // ---------------- 繁简互转（AI 歌单真因） ----------------
+    //
+    // 模型一遇「粤语 / 港台 / 80 年代」就整片用繁体返回（千千闕歌|陳慧嫻），
+    // 而酷我曲库是简体。实测 12 首里 11 首因此搜不到，界面报「只有 0 首能播」。
+    // 下面这组用例就是那次事故的回归测试。
+
+    @Test
+    fun t2s_convertsCommonTraditionalChars() {
+        assertEquals("千千阙歌", T2S.convert("千千闕歌"))
+        assertEquals("陈慧娴", T2S.convert("陳慧嫻"))
+        assertEquals("海阔天空", T2S.convert("海闊天空"))
+        assertEquals("风继续吹", T2S.convert("風繼續吹"))
+        assertEquals("张国荣", T2S.convert("張國榮"))
+        assertEquals("谭咏麟", T2S.convert("譚詠麟"))
+        assertEquals("夕阳之歌", T2S.convert("夕陽之歌"))
+        assertEquals("梅艳芳", T2S.convert("梅艷芳"))
+    }
+
+    @Test
+    fun t2s_leavesSimplifiedUntouched() {
+        // 已经是简体的必须原样返回，否则会把正常歌名转坏
+        for (s in listOf("千千阙歌", "陈慧娴", "海阔天空", "周杰伦", "晴天", "Hello")) {
+            assertEquals(s, T2S.convert(s))
+        }
+        // 日文汉字（新字体）不该被当成繁体转掉 —— 米津玄師 是日本歌手的本名写法
+        assertEquals("米津玄師", T2S.convert("米津玄師"))
+    }
+
+    @Test
+    fun t2s_noopReturnsSameInstance() {
+        // 没有繁体字时不该额外分配（findTrackByName 每首都会调它）
+        val s = "七里香"
+        assertTrue("同引用才算零分配", s === T2S.convert(s))
+    }
+
+    @Test
+    fun t2s_rulesAreConsistent() {
+        // 表错位会把歌名转成乱码，而现象极难反推。这里做一致性自检：
+        // 把常见港台歌名整串转一遍，长度必须不变（1:1 单字映射，永不变长变短）
+        val samples = listOf(
+            "千千闕歌", "陳慧嫻", "海闊天空", "風繼續吹", "張國榮", "譚詠麟",
+            "夕陽之歌", "梅艷芳", "鐵血丹心", "羅文", "講不出再見", "餓狼傳說"
+        )
+        for (s in samples) {
+            assertEquals("长度必须保持：$s", s.length, T2S.convert(s).length)
+        }
+    }
+
+    @Test
+    fun nameMatches_traditionalModelOutputHitsSimplifiedCatalog() {
+        // 左：模型给的繁体；右：酷我返回的简体
+        assertTrue(TrackMatcher.nameMatches("千千闕歌", "千千阙歌"))
+        assertTrue(TrackMatcher.nameMatches("海闊天空", "海阔天空-《九五2班》网络电影插曲"))
+        assertTrue(TrackMatcher.nameMatches("風繼續吹", "风继续吹-《纵横四海》电影主题曲"))
+        assertTrue(TrackMatcher.nameMatches("講不出再見", "讲不出再见"))
+    }
+
+    @Test
+    fun artistMatches_traditionalModelOutputHitsSimplifiedCatalog() {
+        assertTrue(TrackMatcher.artistMatches("陳慧嫻", "陈慧娴"))
+        assertTrue(TrackMatcher.artistMatches("張國榮", "张国荣"))
+        assertTrue(TrackMatcher.artistMatches("譚詠麟", "谭咏麟"))
+        // 多人署名仍要走 token 比对
+        assertTrue(TrackMatcher.artistMatches("羅文", "罗文&甄妮"))
+    }
+
+    @Test
+    fun traditionalStillRejectsWrongSong() {
+        // 繁简归一不能把「不该匹配」变成「匹配」—— 防串歌的底线不能松
+        assertFalse(TrackMatcher.nameMatches("千千闕歌", "千千晚星"))
+        assertFalse(TrackMatcher.artistMatches("張國榮", "陈慧娴"))
+        assertFalse(TrackMatcher.nameMatches("晴天", "晴天娃娃"))
+        // 反过来：括号里的版次标注不该妨碍命中
+        assertTrue(TrackMatcher.nameMatches("千千闕歌", "千千阙歌 (Live)"))
+    }
+
     // ---------------- 歌名 ----------------
 
     @Test
@@ -155,5 +231,40 @@ class TrackMatcherTest {
                 )
             )
         )
+    }
+
+    // ---------------- 翻唱 / 合作署名（实测踩坑回归） ----------------
+
+    @Test
+    fun pickBest_prefersOriginalOverCover() {
+        // 酷我把翻唱排在原唱前面 —— 必须仍然挑原唱
+        val target = c("泡沫", "邓紫棋", 265)
+        val best = TrackMatcher.pickBest(
+            target,
+            listOf(
+                c("泡沫", "张新航&邓 紫 棋", 265), // 翻唱，时长都一样
+                c("泡沫", "邓紫棋", 264)            // 原唱
+            )
+        )
+        assertEquals("邓紫棋", best?.artist)
+    }
+
+    @Test
+    fun pickBest_usesCoverOnlyWhenNoOriginal() {
+        // 没有原唱时才退而用合作版本（折中规则的收益）
+        val target = c("泡沫", "邓紫棋", 265)
+        val best = TrackMatcher.pickBest(
+            target,
+            listOf(c("泡沫", "张新航&邓 紫 棋", 265))
+        )
+        assertEquals("张新航&邓 紫 棋", best?.artist)
+    }
+
+    @Test
+    fun artist_coverWithTargetSecond_passes() {
+        // 折中：目标歌手在第 2 位算命中
+        assertTrue(TrackMatcher.artistMatches("邓紫棋", "张新航&邓紫棋"))
+        // 但目标歌手排到第 3 位就不再放过（噪声太大）
+        assertFalse(TrackMatcher.artistMatches("邓紫棋", "甲&乙&邓紫棋"))
     }
 }

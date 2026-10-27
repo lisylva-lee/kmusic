@@ -61,7 +61,7 @@ class MoyinPlaybackService : MediaSessionService() {
     private var dsdBypassEq: Boolean = true
 
     companion object {
-        /** 后台空闲多久后拆音效链（毫秒）。给「刚暂停就切走」留缓冲。 */
+        /** 空闲多久后拆音效链（毫秒）。给「刚暂停 / 刚切走」留缓冲。 */
         const val FX_RELEASE_DELAY_MS = 15_000L
     }
 
@@ -82,6 +82,24 @@ class MoyinPlaybackService : MediaSessionService() {
             AudioEffectHolder.setDsdBypass(bypass)
         }
 
+        // 用户动了音效（开关 / 滑块 / 档位）→ 这里收尾。
+        //
+        // 两件事必须做，少一件就变成「开关只管一半」：
+        // ① 暂停 15 秒后整条链已被拆（attachedSessionId=0），此时 holder 里所有 ensureXxx
+        //    都因为没有 session 直接 return —— 不改就是"拖了没反应"，必须用当前 session 重新挂；
+        // ② 重新挂上之后仍在"没在播"状态，得把 15 秒释放计时重新装上，不能一直白占池位。
+        AudioEffectHolder.onUserConfigChanged = {
+            val id = player?.audioSessionId ?: 0
+            if (id > 0 && !AudioEffectHolder.isAttached(id)) {
+                AudioEffectHolder.attach(id)
+                if (AudioEffectHolder.attached) {
+                    AudioEffectHolder.clearReleasedFlag()
+                    DiagLog.log("EQ", "用户改音效 → 重建音效链 session=$id")
+                }
+            }
+            scheduleFxRelease()
+        }
+
         // 前后台切换都要评估：
         // - 退到后台：判断是否该拆（配合 isPlaying）
         // - 回到前台：如果之前拆过，这里负责重建音效链
@@ -91,7 +109,9 @@ class MoyinPlaybackService : MediaSessionService() {
             if (!foreground) {
                 DiagLog.log("EQ", "退到后台 → 开始计时（${FX_RELEASE_DELAY_MS / 1000}s 后评估释放）")
                 scheduleFxRelease()
-            } else if (AudioEffectHolder.releasedForBackground) {
+            } else if (AudioEffectHolder.releasedForBackground && player?.isPlaying == true) {
+                // 回前台 + 在播 才重建。只是切回来看看界面（没在播）不该白占池位 ——
+                // 等用户真按下播放时 onIsPlayingChanged 会负责重建。
                 val id = player?.audioSessionId ?: 0
                 if (id > 0) {
                     AudioEffectHolder.attach(id)
@@ -183,6 +203,9 @@ class MoyinPlaybackService : MediaSessionService() {
                 // DSD 旁路状态也要跟着 attach 走 —— 挂在 session 上之前先设好，
                 // 否则第一次 apply 时 EQ 会被打开，DSD 播放中又要多跑一条 EQ
                 AudioEffectHolder.setDsdBypass(dsdBypassEq && DsdPlaybackState.isDsdPlaying)
+                // 冷启动时会话就分配好了、但用户还没点播放 —— 这时 attach 建的链
+                // 没有任何人排释放计划，会一直白占池位（实测：冷启动不播 = 常驻 1 项）。
+                scheduleFxRelease()
             }
 
             /**
@@ -196,8 +219,11 @@ class MoyinPlaybackService : MediaSessionService() {
                 if (playbackState != Player.STATE_READY) return
                 if (offload) return
                 val id = p.audioSessionId
-                if (id > 0 && !AudioEffectHolder.isAttached(id)) {
+                // ⚠️ 只在「准备要播」时补挂：暂停状态下 seek/缓冲也会走到 STATE_READY，
+                // 若不加这道闸，刚被空闲释放的链会被重新抢回来，池位白占。
+                if (id > 0 && !AudioEffectHolder.isAttached(id) && p.playWhenReady) {
                     AudioEffectHolder.attach(id)
+                    scheduleFxRelease()
                 }
             }
 
@@ -258,41 +284,45 @@ class MoyinPlaybackService : MediaSessionService() {
     // ── 音效链后台释放 ──
 
     /**
-     * 后台空闲时把音效链拆掉，把全局 effect 池位还给系统。
+     * 空闲时把音效链拆掉，把全局 effect 池位还给系统。
      *
-     * 判定条件（三条同时满足才拆）：
-     * 1. App 不在前台（没有可见 Activity）；
-     * 2. **当前没有在播**（`!player.isPlaying`）—— 正在播歌时绝不拆，
+     * 判定条件（两条同时满足才拆）：
+     * 1. **当前没有在播**（`!player.isPlaying`）—— 正在播歌时绝不拆，
      *    否则用户切到别的 App 继续听，音效就没了；
-     * 3. 已经空闲满 15 秒 —— 给「刚暂停就切走」留出缓冲，不做急刹。
+     * 2. 已经空闲满 15 秒 —— 给「暂停一下马上继续」留出缓冲，不做急刹。
+     *
+     * 为什么不再要求「App 在后台」：暂停着的音效链对它没有任何意义。
+     * 以前只有退到后台才拆，于是「前台暂停 → 熄火下车」这条路上，
+     * 一条没在用的链会一直挂到进程被杀。
      *
      * 拆完只留配置（存在 [AudioEffectHolder] 的 pendingRestore 里），
-     * 下次 attach 时自动恢复 —— 用户不用重新调一遍。
+     * 下次真正起播时 attach 自动恢复 —— 用户不用重新调一遍。
      */
     private fun scheduleFxRelease() {
         if (offload) return
         val p = player ?: return
-        val foreground = AppVisibility.isForeground
-        val playing = p.isPlaying
-        if (foreground || playing) {
-            // 回到前台或在播 → 取消释放计划；但如果之前拆过，这里要重建
+        if (p.isPlaying) {
+            // 在播 → 取消释放计划；之前拆过就顺手重建
             if (AudioEffectHolder.releasedForBackground) {
                 val id = p.audioSessionId
                 if (id > 0) {
                     AudioEffectHolder.attach(id)
-                    DiagLog.log("EQ", "回到前台/开始播放 → 重建音效链 session=$id")
+                    // attach 之后必须清标记：不清的话 onIsPlayingChanged / onPlayWhenReadyChanged
+                    // 会各走一次重建分支（实测同一次起播打两条同样的日志）
+                    if (AudioEffectHolder.attached) AudioEffectHolder.clearReleasedFlag()
+                    DiagLog.log("EQ", "开始播放 → 重建音效链 session=$id")
                 }
             }
             fxReleaseRunnable?.let { handler.removeCallbacks(it) }
             fxReleaseRunnable = null
             return
         }
-        // 后台且没在播 → 15 秒后拆
+        // 没在播（前台后台都算）→ 15 秒后拆
         if (fxReleaseRunnable != null) return
         val runnable = Runnable {
             fxReleaseRunnable = null
             val pp = player ?: return@Runnable
-            if (AppVisibility.isForeground || pp.isPlaying) return@Runnable
+            if (pp.isPlaying) return@Runnable
             val id = pp.audioSessionId
             if (id > 0) AudioEffectHolder.releaseForBackground(id)
         }
