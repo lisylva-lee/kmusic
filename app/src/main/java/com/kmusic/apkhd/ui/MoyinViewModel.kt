@@ -91,7 +91,8 @@ import com.kmusic.apkhd.playback.ResumePlan
 import com.kmusic.apkhd.data.UserPlaylistStore
 import com.kmusic.apkhd.data.PlaylistFavStore
 import com.kmusic.apkhd.model.UserPlaylist
-import com.kmusic.apkhd.playback.AudioEffectHolder
+import com.kmusic.apkhd.playback.EqProcessor
+import com.kmusic.apkhd.playback.FxChain
 import com.kmusic.apkhd.playback.EqPresets
 import com.kmusic.apkhd.playback.UserEqPresets
 import com.kmusic.apkhd.playback.DsdPlaybackState
@@ -3443,54 +3444,63 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var eqPreset by mutableStateOf(0)
         private set
+
     /**
      * 均衡器预设名。
      *
-     * v2.3.2 起是**内置表**（7 套），不再读设备 —— 合并进 DynamicsProcessing 后
-     * 没有芯片原厂的 usePreset() 可用，所以列表一开机就有内容，不用等 audio session。
+     * v2.3.5 起是**内置十段表**（12 套），不读设备 —— 均衡器已经不走系统音效了，
+     * 自然也没有「芯片原厂预设」这回事。列表一开机就有内容，不用等起播。
      */
-    var eqPresets by mutableStateOf(AudioEffectHolder.presetNames())
+    var eqPresets by mutableStateOf(FxChain.presetNames())
         private set
 
     /** 本进程是否已做过「设备预设 → 内置预设」的迁移（只做一次） */
     private var presetMigrated = false
 
-    /** 设备是否真的挂了均衡器 —— 没挂就别摆开关，点了不动比不显示更糟 */
-    var eqAvailable by mutableStateOf(false)
+    /**
+     * 均衡器是否可用。
+     *
+     * v2.3.5 起恒为 true：均衡器跑在自己的 PCM 管线上，不需要向系统申请任何音效资源，
+     * 于是「本机不支持」「池位被占」两种状态一起消失了。字段留着是因为界面签名还在用，
+     * 将来真有平台限制时也仍然从同一个地方读。
+     */
+    var eqAvailable by mutableStateOf(true)
         private set
 
-    /** 各频段增益（mB），下标即 band */
+    /** 各频段增益（mB），下标即 band —— 恒为十段 */
     var eqBands by mutableStateOf<List<Int>>(emptyList())
         private set
+
     /** 各频段中心频率（Hz） */
     var eqFreqs by mutableStateOf<List<Int>>(emptyList())
         private set
+
     /** 可调范围，[最小 mB, 最大 mB] */
-    var eqRange by mutableStateOf(intArrayOf(-1500, 1500))
+    var eqRange by mutableStateOf(intArrayOf(EqProcessor.LEVEL_MIN, EqProcessor.LEVEL_MAX))
         private set
-    /** 是否处在自定义曲线（用户拖过滑块） */
+
+    /** 是否处在自定义曲线（用户拖过圆点） */
     var eqCustom by mutableStateOf(false)
         private set
 
-    /** 均衡器挂上之后才有预设名 —— 播放器建音频轨时调一次 */
-    fun refreshEqPresets() {
-        eqAvailable = AudioEffectHolder.attached
-        eqPresets = AudioEffectHolder.presetNames()
-        refreshEqBands()
+    /** 刷新频段与曲线 */
+    fun refreshEqBands() {
+        eqFreqs = FxChain.bandFreqs().toList()
+        eqBands = FxChain.bandLevels().toList()
+        eqRange = FxChain.bandRange()
+        eqCustom = FxChain.customBands
     }
 
-    fun refreshEqBands() {
-        eqFreqs = AudioEffectHolder.bandFreqs().toList()
-        eqBands = AudioEffectHolder.bandLevels().toList()
-        eqRange = AudioEffectHolder.bandRange()
-        eqCustom = AudioEffectHolder.customBands
+    /** 兼容旧调用点：预设表不再依赖「挂载」，刷新频段即可 */
+    fun refreshEqPresets() {
+        eqPresets = FxChain.presetNames()
+        refreshEqBands()
     }
 
     fun changeEqEnabled(on: Boolean) {
         eqEnabled = on
-        AudioEffectHolder.configure(on, eqPreset)
-        AudioEffectHolder.onUserEdited()
-        refreshEqPresets()
+        FxChain.configure(on, eqPreset)
+        refreshEqBands()
         viewModelScope.launch { settings.setEqEnabled(on) }
     }
 
@@ -3499,8 +3509,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         eqCustom = false
         // 选预设隐含「我要用均衡器」：关着选预设没有任何听感变化，用户会以为坏了。
         eqEnabled = true
-        AudioEffectHolder.usePresetMode(index)
-        AudioEffectHolder.onUserEdited()
+        FxChain.usePresetMode(index)
         refreshEqBands()
         viewModelScope.launch {
             settings.setEqPreset(index)
@@ -3514,19 +3523,21 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      * 会顺手打开均衡器并切到自定义 —— 用户拖了却听不到变化，是最容易被当成「坏了」的情况。
      */
     fun changeEqBand(band: Int, levelMiliBel: Int) {
-        // 频段拖动是唯一没法靠 uiautomator 读数的地方（自绘 thumb 没有语义节点，
+        // 频段拖动是唯一没法靠 uiautomator 读数的地方（自绘圆点没有语义节点，
         // 且这个页面 dump 会因 U+0 崩），打一行日志当验收锚点。
-        DiagLog.log("EQ", "频段 $band → ${levelMiliBel / 100} dB")
-        AudioEffectHolder.setBandLevel(band, levelMiliBel)
-        AudioEffectHolder.onUserEdited()
+        DiagLog.log("EQ", "频段 $band（${eqFreqs.getOrNull(band) ?: "?"}Hz）→ ${levelMiliBel / 100} dB")
+        FxChain.setBandLevel(band, levelMiliBel)
         eqEnabled = true
         eqCustom = true
-        eqBands = AudioEffectHolder.bandLevels().toList()
+        eqBands = FxChain.bandLevels().toList()
     }
 
-    // ---------------- 用户自定义曲线（A3） ----------------
+    // ---------------- 用户自定义曲线 ----------------
+    //
+    // 只存「十段增益 + 名字」。存整个音效 profile 会让「保存曲线」变成
+    // 「顺手把低音也存进去」，语义不彻底 —— 用户点的是保存这条曲线。
 
-    /** 用户存的曲线（上限 20 条，存在 SharedPreferences，不占系统音效池位） */
+    /** 用户存的曲线（上限 20 条，SharedPreferences，不占系统资源） */
     var userEqPresets by mutableStateOf<List<UserEqPresets.Preset>>(emptyList())
         private set
 
@@ -3534,38 +3545,31 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         userEqPresets = UserEqPresets.load(getApplication())
     }
 
-    /**
-     * 把当前 5 段曲线存成一条命名预设。
-     *
-     * 只存曲线本身，不带低音/响度 —— 用户点的是「保存这条曲线」，
-     * 顺手把别的音效一起存进去会让这个动作的语义变得说不清。
-     */
+    /** 把当前十段曲线存成一条命名预设 */
     fun saveCurrentEqCurve(name: String) {
-        val gains = AudioEffectHolder.bandLevels().toList()
+        val gains = FxChain.bandLevels().toList()
         if (gains.isEmpty()) return
-        UserEqPresets.savePreset(getApplication(), name, gains)
-        reloadUserPresets()
+        userEqPresets = UserEqPresets.savePreset(getApplication(), name, gains)
         DiagLog.log("EQ", "保存曲线「$name」= ${gains.joinToString(",")}")
     }
 
     fun deleteEqCurve(name: String) {
-        UserEqPresets.delete(getApplication(), name)
-        reloadUserPresets()
+        userEqPresets = UserEqPresets.delete(getApplication(), name)
     }
 
-    /** 套用一条用户曲线：走 applyCurve，命中内置曲线时界面会自动显示内置名 */
+    /**
+     * 套用一条用户曲线。
+     *
+     * 走 [FxChain.applyCurve]：十段全写进 manualLevels 并标记 custom ——
+     * 曲线是用户自己的，不该再被任何内置预设覆盖。
+     */
     fun applyEqCurve(preset: UserEqPresets.Preset) {
-        val gains = preset.gains.toIntArray()
-        AudioEffectHolder.applyCurve(gains)
-        AudioEffectHolder.onUserEdited()
+        FxChain.applyCurve(preset.gains.toIntArray())
         eqEnabled = true
         eqCustom = true
-        eqBands = AudioEffectHolder.bandLevels().toList()
-        refreshEqPresets()
-        // 记住「现在用的是自定义」—— 否则重进页面顶部又显示成某个内置预设名
-        viewModelScope.launch {
-            settings.setEqEnabled(true)
-        }
+        eqBands = FxChain.bandLevels().toList()
+        eqPreset = FxChain.presetIndex
+        viewModelScope.launch { settings.setEqEnabled(true) }
     }
 
     // ---------------- 睡眠定时 ----------------
@@ -3614,9 +3618,9 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------- 增强音效（低音/响度） ----------------
     //
-    // v2.3.2：环绕、混响、动态范围已删除。三项（均衡器/低音/响度）合并进
-    // 一个 DynamicsProcessing 实例，只占 1 个 effect 池位。删掉的三项在
-    // 部分 ROM 上根本建不出来（真机日志里混响 377 次失败），留着只会白饿死别的项。
+    // v2.3.2 删掉环绕／混响／动态范围；v2.3.5 起三项（均衡器/低音/响度）全部搬进
+    // 自研的 EqProcessor，不再占用任何系统音效池位 —— 于是这一整块里
+    // 「池位」「重挂」「饿死」「资源占用」的概念全部退场。
 
     /** 0..1000，0 = 关 */
     var fxBass by mutableStateOf(0)
@@ -3625,7 +3629,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     var fxLoudness by mutableStateOf(0)
         private set
 
-    /** 省电播放（offload）：开了音效链就不可用 */
+    /** 省电播放（offload）：开了 PCM 直通 DSP，音效不可用 */
     var audioOffload by mutableStateOf(false)
         private set
 
@@ -3645,55 +3649,38 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     var dsdLabel by mutableStateOf<String?>(null)
         private set
 
-    /** 设备到底支不支持某一项 —— 界面据此隐藏，不做假开关 */
-    var fxBassAvailable by mutableStateOf(false)
-        private set
-    var fxLoudnessAvailable by mutableStateOf(false)
-        private set
-    /** 有音效项因 effect 池被占满而不可用（可重挂恢复） */
-    var fxStarved by mutableStateOf(false)
-        private set
-    /** 逐项是否「这次没抢到池位」——决定界面显示「资源占用」还是正常值 */
-    var eqStarved by mutableStateOf(false)
-        private set
-    var fxBassStarved by mutableStateOf(false)
-        private set
-    var fxLoudnessStarved by mutableStateOf(false)
-        private set
-
     /**
-     * 本 App 此刻实际占用几个系统音效池位。
+     * 低音 / 响度是否可用。
      *
-     * 面板上直接写出来：用户才算得清「关掉的项确实没在占地方」。
-     * 全关时是 0，开一项加 1。
+     * v2.3.5 起恒为 true —— 它们和均衡器共用同一条自研处理器，不向系统申请资源，
+     * 也就没有「本机不支持」。字段留在签名里，省得界面到处改。
      */
-    var fxHeldCount by mutableStateOf(0)
+    val fxBassAvailable: Boolean get() = true
+    val fxLoudnessAvailable: Boolean get() = true
 
-    /**
-     * 用户配置里开着的音效项数（和 fxHeldCount 不同：暂停 15 秒归还池位后
-     * 这个数仍 > 0 —— 界面靠它区分「本来就没开」和「暂停中暂时归还」）。
-     */
+    /** 用户配置里开着的音效项数（0..3）—— 界面用它区分「全关」和「还没起播」 */
     var fxWantedCount by mutableStateOf(0)
         private set
 
-    /** 音效链挂上之后刷新可用性 —— 和 refreshEqPresets 一起调 */
-    fun refreshFxAvailability() {
-        fxHeldCount = AudioEffectHolder.heldCount
-        fxWantedCount = AudioEffectHolder.wantedCount
-        fxBassAvailable = AudioEffectHolder.bassAvailable
-        fxLoudnessAvailable = AudioEffectHolder.loudnessAvailable
-        eqStarved = AudioEffectHolder.eqStarved
-        fxBassStarved = AudioEffectHolder.bassStarved
-        fxLoudnessStarved = AudioEffectHolder.loudnessStarved
-        fxStarved = AudioEffectHolder.starvedTypes.isNotEmpty()
-    }
+    /** 处理器是否已接进 PCM 管线。0 = 还没起播（不是「不可用」） */
+    var fxSampleRate by mutableStateOf(0)
+        private set
 
-    /** 重挂音效链：effect 池被占满时把配额抢回来，不用杀进程 */
-    fun reattachFx() {
-        val ok = AudioEffectHolder.reattach()
-        refreshFxAvailability()
-        pushFx()
-        toast(if (ok) "音效链已重挂" else "重挂失败，请重启 App")
+    /**
+     * 让给 EQ 的前级余量（dB）。
+     *
+     * 整条曲线的**解析峰值**，不是「十段里最大的那个」—— 相邻段在中间频率会叠加，
+     * 取最大值会低估（31/62/125 全拉满时峰值比单段高 4dB 以上），
+     * 余量扣少了，响度就会提前撞限幅器。
+     */
+    var fxHeadroomDb by mutableStateOf(0f)
+        private set
+
+    /** 把处理器报上来的运行态同步到界面（状态文案要写「48 kHz 生效中」） */
+    fun refreshFxRuntime() {
+        fxWantedCount = FxChain.wantedCount
+        fxSampleRate = FxChain.activeSampleRate
+        fxHeadroomDb = FxChain.headroomDb()
     }
 
     /**
@@ -3727,33 +3714,28 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         toast("DSD 输出已设为 ${rate / 1000}.1 kHz，下次起播生效")
     }
 
-    /** DSD 自动旁路均衡器开关。热生效 —— 只是把设备上的 EQ 开关按掉。 */
+    /** DSD 自动旁路均衡器开关。热生效 —— 处理器切透传，不拆管线。 */
     fun changeDsdBypassEq(on: Boolean) {
         if (dsdBypassEq == on) return
         dsdBypassEq = on
         viewModelScope.launch { settings.setDsdBypassEq(on) }
-        AudioEffectHolder.setDsdBypass(on && dsdPlaying)
+        FxChain.setDsdBypass(on && dsdPlaying)
     }
 
     private fun pushFx() {
-        AudioEffectHolder.configureEnhanced(fxBass, fxLoudness)
-    }
-
-    /** 用户主动改音效（开关/强度/档位）—— 建完还要通知服务重排释放计时 */
-    private fun pushFxUser() {
-        pushFx()
-        AudioEffectHolder.onUserEdited()
+        FxChain.configureEnhanced(fxBass, fxLoudness)
+        refreshFxRuntime()
     }
 
     fun changeFxBass(v: Int) {
         fxBass = v.coerceIn(0, 1000)
-        pushFxUser()
+        pushFx()
         viewModelScope.launch { settings.setFxBass(fxBass) }
     }
 
     fun changeFxLoudness(v: Int) {
         fxLoudness = v.coerceIn(0, 1500)
-        pushFxUser()
+        pushFx()
         viewModelScope.launch { settings.setFxLoudness(fxLoudness) }
     }
 
@@ -4555,50 +4537,34 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { settings.aiEndpoint.collect { aiEndpoint = it } }
         viewModelScope.launch { settings.aiApiKey.collect { aiApiKey = it } }
         viewModelScope.launch { settings.aiModel.collect { aiModel = it } }
-        viewModelScope.launch { settings.eqEnabled.collect { eqEnabled = it; AudioEffectHolder.configure(it, eqPreset) } }
+        viewModelScope.launch { settings.eqEnabled.collect { eqEnabled = it; FxChain.configure(it, eqPreset) } }
         viewModelScope.launch {
             settings.eqPreset.collect { raw ->
-                // 老版本存的是**设备预设下标**（0..9），现在换成 7 套内置表。
+                // 老版本存的是**设备预设下标**（0..9），现在换成了内置表。
                 // 只在本次进程第一次读到旧值时迁移一次，之后不再动用户的选择。
                 val idx = if (presetMigrated) raw else {
                     presetMigrated = true
-                    AudioEffectHolder.migratePresetIndex(raw).also { m ->
+                    FxChain.migratePresetIndex(raw).also { m ->
                         eqPreset = m
                         if (m != raw) viewModelScope.launch { settings.setEqPreset(m) }
                     }
                 }
                 eqPreset = idx
-                AudioEffectHolder.configure(eqEnabled, idx)
+                FxChain.configure(eqEnabled, idx)
                 refreshEqBands()
             }
         }
+        reloadUserPresets()
         viewModelScope.launch { settings.fxBass.collect { fxBass = it; pushFx() } }
         viewModelScope.launch { settings.fxLoudness.collect { fxLoudness = it; pushFx() } }
-        // 音效链真正建出来的时刻只有 Service 知道 —— 跟着版本号刷新可用性和预设
+        // 处理器是普通对象（不是 Compose State），靠版本号把它报上来的运行态
+        // （采样率 / 开了几项）同步到界面。没有「重建链」这回事，所以这里只读不推。
         viewModelScope.launch {
-            snapshotFlow { AudioEffectHolder.sessionVersion }.collect { v ->
+            snapshotFlow { FxChain.version }.collect { v ->
                 if (v > 0) {
-                    refreshEqPresets()
-                    refreshFxAvailability()
-                    pushFx()
+                    refreshEqBands()
+                    refreshFxRuntime()
                 }
-            }
-        }
-        // 失败只刷新界面状态，**不能**再 pushFx：
-        // pushFx 会去重建效果 → 又失败 → 又刷新，一秒能滚出几千轮，CPU 烧到 100%。
-        // （sessionVersion 那条路有 pushFx，所以失败时绝对不能碰它。）
-        // 池位占用变化：面板上那个「本机占用 N 项」跟着动
-        viewModelScope.launch {
-            snapshotFlow { AudioEffectHolder.poolTick }.collect { v ->
-                if (v > 0) {
-                    fxHeldCount = AudioEffectHolder.heldCount
-                    fxWantedCount = AudioEffectHolder.wantedCount
-                }
-            }
-        }
-        viewModelScope.launch {
-            snapshotFlow { AudioEffectHolder.effectFailedTick }.collect { v ->
-                if (v > 0) refreshFxAvailability()
             }
         }
         // 下载任务（真身在 DownloadCenter，前台服务驱动，退出 App 也继续）
@@ -4630,7 +4596,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         DsdPlaybackState.setListener {
             dsdPlaying = DsdPlaybackState.isDsdPlaying
             dsdLabel = DsdPlaybackState.currentLabel
-            AudioEffectHolder.setDsdBypass(dsdBypassEq && dsdPlaying)
+            FxChain.setDsdBypass(dsdBypassEq && dsdPlaying)
         }
         viewModelScope.launch { settings.wifiOnlyDownload.collect { wifiOnlyDownload = it } }
         viewModelScope.launch { settings.lyricOffsetMs.collect { lyricOffsetMs = it } }

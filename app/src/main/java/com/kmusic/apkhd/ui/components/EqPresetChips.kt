@@ -39,6 +39,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import com.kmusic.apkhd.playback.EqPresetGroup
 import com.kmusic.apkhd.playback.EqPresets
+import com.kmusic.apkhd.playback.EqBands
 import com.kmusic.apkhd.playback.UserEqPresets
 import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.wdp
@@ -186,6 +187,8 @@ fun suggestedCurveName(custom: Boolean, presetName: String?): String =
 @Composable
 fun SaveCurveDialog(
     suggestion: String,
+    /** 当前曲线的段数（十段）。文案里说出来，用户才知道存的是几个点 */
+    bandCount: Int = EqBands.COUNT,
     onDismiss: () -> Unit,
     onConfirm: (String) -> Unit
 ) {
@@ -219,7 +222,7 @@ fun SaveCurveDialog(
             Text("保存曲线", color = c.t1, fontSize = 15.wsp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(4.wdp))
             Text(
-                "只存这 5 段增益，不含低音/响度。同名会覆盖。",
+                "只存这 $bandCount 段增益，不含低音/响度。同名会覆盖。",
                 color = c.t3,
                 fontSize = 11.wsp
             )

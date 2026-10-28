@@ -133,7 +133,10 @@ class EqCurveMathTest {
     fun `前七套老预设的顺序与曲线一字不改`() {
         // 老用户存的是 eq_preset 下标。这七项一旦被插入/重排，
         // 升级后听到的就是另一条曲线 —— 这条断言是那种 bug 唯一的前置防线。
-        val expected = listOf(
+        //
+        // v2.3.5 起曲线是十段，但**源数据仍是当年那五段**，经 EqBands.resample 插值。
+        // 所以这里连着比对两件事：顺序没动 + 插值出来的确实是那根曲线的新刻度采样。
+        val legacy = listOf(
             "原声" to intArrayOf(0, 0, 0, 0, 0),
             "流行" to intArrayOf(-100, 200, 400, 200, -100),
             "摇滚" to intArrayOf(400, 150, -100, 200, 400),
@@ -142,9 +145,24 @@ class EqCurveMathTest {
             "低音" to intArrayOf(600, 300, 0, -100, -200),
             "高音" to intArrayOf(-200, -100, 0, 300, 600)
         )
-        expected.forEachIndexed { i, (name, gains) ->
+        legacy.forEachIndexed { i, (name, gains) ->
             assertEquals(name, EqPresets.nameOf(i))
-            assertTrue(EqPresets.gainsOf(i).contentEquals(gains))
+            val want = EqBands.resample(gains)
+            assertTrue(
+                "预设 #$i（$name）曲线不符：${EqPresets.gainsOf(i).toList()} != ${want.toList()}",
+                EqPresets.gainsOf(i).contentEquals(want)
+            )
+        }
+    }
+
+    @Test
+    fun `每套预设都是十段，且增益在可调范围内`() {
+        for (i in 0 until EqPresets.builtInCount) {
+            val g = EqPresets.gainsOf(i)
+            assertEquals("预设 #$i（${EqPresets.nameOf(i)}）段数", EqBands.COUNT, g.size)
+            g.forEach { v ->
+                assertTrue("超出范围: $v", v >= EqProcessor.LEVEL_MIN && v <= EqProcessor.LEVEL_MAX)
+            }
         }
     }
 
@@ -171,23 +189,24 @@ class EqCurveMathTest {
      * （调用即抛 RuntimeException，见 app/build.gradle.kts 的 unitTests 配置）。
      * 所以这里只钉「一条曲线合法/不合法的判据」，读写实现复用同一组判据：
      *  - 名字去空白后不能为空；
-     *  - 增益必须正好 5 段（少一段就会让 applyCurve 只写 4 段，第 5 段留着上一条的值）。
+     *  - 增益必须正好十段（少一段就会让 applyCurve 少写一段，那一段留着上一条的值）。
      */
     private fun isValidCurve(name: String, gains: List<Int>): Boolean =
-        name.trim().isNotEmpty() && gains.size == 5
+        name.trim().isNotEmpty() && gains.size == EqBands.COUNT
 
     @Test
     fun `合法曲线通过格式校验`() {
-        assertTrue(isValidCurve("通勤", listOf(300, 200, 0, 150, 200)))
-        assertTrue(isValidCurve("夜间", listOf(-200, -100, 0, -100, -200)))
+        assertTrue(isValidCurve("通勤", EqBands.resample(intArrayOf(300, 200, 0, 150, 200)).toList()))
+        assertTrue(isValidCurve("夜间", EqBands.resample(intArrayOf(-200, -100, 0, -100, -200)).toList()))
     }
 
     @Test
     fun `残缺曲线被判非法`() {
-        assertFalse(isValidCurve("", listOf(0, 0, 0, 0, 0)))
-        assertFalse(isValidCurve("   ", listOf(0, 0, 0, 0, 0)))
+        assertFalse(isValidCurve("", List(EqBands.COUNT) { 0 }))
+        assertFalse(isValidCurve("   ", List(EqBands.COUNT) { 0 }))
         assertFalse(isValidCurve("只有四段", listOf(1, 2, 3, 4)))
-        assertFalse(isValidCurve("多了一段", listOf(1, 2, 3, 4, 5, 6)))
+        assertFalse(isValidCurve("旧五段", listOf(1, 2, 3, 4, 5)))
+        assertFalse(isValidCurve("多了一段", List(EqBands.COUNT + 1) { 1 }))
     }
 
     @Test
@@ -202,22 +221,26 @@ class EqCurveMathTest {
         assertEquals(20, UserEqPresets.MAX_PRESETS)
     }
 
-    // ── 音效状态判定（A4） ──
+    // ── 音效状态判定 ──
+    //
+    // 旧用例里有 PoolStarved / Suspended 两个分支，那套状态空间随着
+    // 系统音效池一起消失了 —— 处理器就在 PCM 管线上，既不排队也不交还。
+    // 现在只剩四种：改着声音、被主动旁路（省电/DSD）、还没起播、什么都没开。
 
     @Test
     fun `省电播放时一律报已旁路，哪怕三项都开着`() {
         val s = FxStatus.resolve(
             offload = true, dsdPlaying = false, dsdBypassEq = true,
-            wanted = 3, held = 3, starved = false
+            wanted = 3, attached = true, sampleRateHz = 48_000
         )
         assertEquals(FxStatus.Bypassed(FxStatus.Bypassed.Reason.OFFLOAD), s)
     }
 
     @Test
-    fun `DSD 旁路优先于池位状态`() {
+    fun `DSD 旁路优先于已接管线`() {
         val s = FxStatus.resolve(
             offload = false, dsdPlaying = true, dsdBypassEq = true,
-            wanted = 1, held = 0, starved = true
+            wanted = 1, attached = true, sampleRateHz = 44_100
         )
         assertEquals(FxStatus.Bypassed(FxStatus.Bypassed.Reason.DSD), s)
     }
@@ -226,7 +249,7 @@ class EqCurveMathTest {
     fun `用户允许 DSD 不旁路时照常生效`() {
         val s = FxStatus.resolve(
             offload = false, dsdPlaying = true, dsdBypassEq = false,
-            wanted = 1, held = 1, starved = false
+            wanted = 1, attached = true, sampleRateHz = 44_100
         )
         assertTrue(s is FxStatus.Active)
     }
@@ -235,57 +258,35 @@ class EqCurveMathTest {
     fun `一项没开是 Idle，不是旁路`() {
         assertEquals(
             FxStatus.Idle,
-            FxStatus.resolve(false, false, true, wanted = 0, held = 0, starved = false)
+            FxStatus.resolve(false, false, true, wanted = 0, attached = true)
         )
     }
 
     @Test
-    fun `暂停中归还池位时不谎报全关`() {
-        // 均衡器开着、点了暂停：App 会主动把音效槽还回去，held 归零。
-        // 这时候说「三项全关」和界面上的开关自相矛盾，必须是 Suspended。
+    fun `开着但还没起播报 Waiting`() {
+        // 关键区分：没起播 ≠ 没生效。以前这里报「全关」，跟界面上的开关自相矛盾。
         assertEquals(
-            FxStatus.Suspended,
-            FxStatus.resolve(
-                offload = false, dsdPlaying = false, dsdBypassEq = true,
-                wanted = 1, held = 0, starved = false, paused = true
-            )
-        )
-        // 播放中同样的参数、held 仍是 0，且不是暂停 → 那才是真的没挂上
-        assertEquals(
-            FxStatus.Bypassed(FxStatus.Bypassed.Reason.ALL_OFF),
-            FxStatus.resolve(
-                offload = false, dsdPlaying = false, dsdBypassEq = true,
-                wanted = 1, held = 0, starved = false, paused = false
-            )
+            FxStatus.Waiting,
+            FxStatus.resolve(false, false, true, wanted = 1, attached = false)
         )
     }
 
     @Test
-    fun `池满优先于暂停`() {
-        // 池被别的 App 占满 + 暂停：这属于 starved（恢复播放会重试），不是主动归还
+    fun `全关优先于未起播`() {
         assertEquals(
-            FxStatus.PoolStarved,
-            FxStatus.resolve(
-                offload = false, dsdPlaying = false, dsdBypassEq = true,
-                wanted = 2, held = 0, starved = true, paused = true
-            )
+            FxStatus.Idle,
+            FxStatus.resolve(false, false, true, wanted = 0, attached = false)
         )
     }
 
     @Test
-    fun `想开但抢不到池位报 PoolStarved`() {
-        assertEquals(
-            FxStatus.PoolStarved,
-            FxStatus.resolve(false, false, true, wanted = 2, held = 0, starved = true)
+    fun `生效时把采样率与余量带出来`() {
+        val s = FxStatus.resolve(
+            offload = false, dsdPlaying = false, dsdBypassEq = true,
+            wanted = 2, attached = true, sampleRateHz = 48_000,
+            headroomDb = 4.5f, loudnessAppliedDb = 3.5f, loudnessRequestedDb = 8f
         )
-    }
-
-    @Test
-    fun `开着却占用为 0 报全关旁路`() {
-        assertEquals(
-            FxStatus.Bypassed(FxStatus.Bypassed.Reason.ALL_OFF),
-            FxStatus.resolve(false, false, true, wanted = 2, held = 0, starved = false)
-        )
+        assertEquals(FxStatus.Active(48_000, 4.5f, 3.5f, 8f), s)
     }
 
     // ── 取色门禁：不合格必须返回 null（由调用方回退 accent） ──
@@ -411,5 +412,104 @@ class EqCurveMathTest {
             out.accentLine.toArgb()
         )
         assertEquals(tint, out.accentFill)
+    }
+
+    // ── 十段：频点与旧曲线迁移 ──
+
+    @Test
+    fun `十段频点是一个倍频程一段，从 31 到 16k`() {
+        assertEquals(10, EqBands.COUNT)
+        assertEquals(
+            listOf(31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000),
+            EqBands.FREQS.toList()
+        )
+        // 相邻段比值都接近 2 —— 有一个不接近，就不是「每段一个倍频程」
+        for (i in 1 until EqBands.COUNT) {
+            val ratio = EqBands.FREQS[i].toFloat() / EqBands.FREQS[i - 1]
+            assertTrue("第 $i 段比值 $ratio 偏离 2", ratio > 1.8f && ratio < 2.2f)
+        }
+    }
+
+    @Test
+    fun `旧五段插值成十段：端点守住，中间单调`() {
+        // 低音曲线：60Hz +6dB 一路降到 14kHz -2dB，中间不该出现反方向的鼓包
+        val out = EqBands.resample(intArrayOf(600, 300, 0, -100, -200))
+        assertEquals(EqBands.COUNT, out.size)
+        assertEquals("最左段取源曲线首值", 600, out.first())
+        assertEquals("最右段取源曲线末值", -200, out.last())
+        for (i in 1 until out.size) {
+            assertTrue("第 $i 段反向抬头: ${out.toList()}", out[i] <= out[i - 1])
+        }
+    }
+
+    @Test
+    fun `插值不外推：两端之外不放大`() {
+        // 源曲线首段就是 +900，插值后最左段也只能是 +900，不能因为外推变成 +1200
+        val out = EqBands.resample(intArrayOf(900, 0, 0, 0, 0))
+        assertEquals(900, out.first())
+        assertEquals(0, out.last())
+        assertTrue(out.all { it in -900..900 })
+    }
+
+    @Test
+    fun `已经是十段的曲线原样返回`() {
+        val ten = intArrayOf(100, 90, 80, 70, 60, 50, 40, 30, 20, 10)
+        assertTrue(EqBands.resample(ten).contentEquals(ten))
+    }
+
+    // ── Biquad：系数与幅频响应 ──
+
+    @Test
+    fun `0dB 的 peaking 就是直通`() {
+        val c = Biquad.peaking(1_000f, 0f, 1.4f, 48_000f)
+        // a1 = a2 = 0 且 b0 = 1 时传递函数恒为 1
+        assertEquals(1f, c[0], 1e-5f)
+        assertEquals(0f, c[1], 1e-5f)
+        assertEquals(0f, c[2], 1e-5f)
+    }
+
+    @Test
+    fun `peaking 在中心频率处的增益就是设定值`() {
+        for (db in listOf(-12f, -6f, 3f, 9f)) {
+            val c = Biquad.peaking(1_000f, db, 1.4f, 48_000f)
+            val mag = Biquad.magnitudeAt(c, 1_000f, 48_000f)
+            val got = 20f * kotlin.math.log10(mag)
+            assertEquals("设定 $db dB", db, got, 0.2f)
+        }
+    }
+
+    @Test
+    fun `peaking 的增益在远离中心频率处回到 0`() {
+        val c = Biquad.peaking(1_000f, 12f, 1.4f, 48_000f)
+        val low = 20f * kotlin.math.log10(Biquad.magnitudeAt(c, 30f, 48_000f))
+        val high = 20f * kotlin.math.log10(Biquad.magnitudeAt(c, 18_000f, 48_000f))
+        assertEquals(0f, low, 1.5f)
+        assertEquals(0f, high, 1.5f)
+    }
+
+    @Test
+    fun `串联峰值高于单段最大值（相邻段会叠加）`() {
+        // 这是「余量不能取十段最大值」的实证：31/62/125 全拉满时，
+        // 峰值出现在段与段之间，比 +12dB 还高。
+        val gains = IntArray(EqBands.COUNT) { 0 }
+        gains[0] = 1_200; gains[1] = 1_200; gains[2] = 1_200
+        val peak = Biquad.peakBoostDb(gains, 0, 48_000f, 110f, 12f, 1.4f)
+        assertTrue("峰值 $peak 未超过单段 12dB", peak > 12.5f)
+        assertTrue("峰值 $peak 大得不合理", peak < 24f)
+    }
+
+    @Test
+    fun `全平曲线的串联峰值是 0`() {
+        val peak = Biquad.peakBoostDb(IntArray(EqBands.COUNT), 0, 48_000f, 110f, 12f, 1.4f)
+        assertEquals(0f, peak, 0.05f)
+    }
+
+    @Test
+    fun `衰减曲线不产生正余量`() {
+        // 全段衰减时串联峰值必然 < 0，但 headroom 的语义是「要让出多少」——
+        // 让出量不可能为负（补回去等于偷着加响度），所以契约是夹到 0。
+        val gains = IntArray(EqBands.COUNT) { -1_200 }
+        val peak = Biquad.peakBoostDb(gains, 0, 48_000f, 110f, 12f, 1.4f)
+        assertEquals("全衰减时应夹到 0", 0f, peak, 0.01f)
     }
 }

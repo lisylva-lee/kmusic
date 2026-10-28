@@ -137,8 +137,6 @@ fun ProfileScreen(
     onAiModelChange: (String) -> Unit = {},
     eqEnabled: Boolean = false,
     eqAvailable: Boolean = false,
-    /** 均衡器这次没抢到池位（不是设备没有） */
-    eqStarved: Boolean = false,
     onEqEnabledChange: (Boolean) -> Unit = {},
     onRefreshEq: () -> Unit = {},
     eqPresets: List<String> = emptyList(),
@@ -157,22 +155,16 @@ fun ProfileScreen(
     onDeleteEqCurve: (String) -> Unit = {},
     // 增强音效（低音/响度）。0 为关闭
     //
-    // v2.3.2：环绕、混响、动态范围已删除 —— 三项（均衡器/低音/响度）合并进
-    // 一个 DynamicsProcessing 实例，只占 1 个 effect 池位。
+    // v2.3.2 删掉环绕/混响/动态范围；v2.3.5 起三项全部搬进自研处理器，
+    // 不占系统音效池位 —— 于是「可用性」「资源占用」「重挂」这些概念一并退场。
     fxBass: Int = 0,
     onFxBassChange: (Int) -> Unit = {},
     fxLoudness: Int = 0,
     onFxLoudnessChange: (Int) -> Unit = {},
-    fxBassAvailable: Boolean = false,
-    fxLoudnessAvailable: Boolean = false,
-    /** 有音效因 effect 池被占满而不可用（可重挂恢复） */
-    fxStarved: Boolean = false,
-    fxBassStarved: Boolean = false,
-    fxLoudnessStarved: Boolean = false,
-    /** 本 App 此刻实际占用的系统音效池位数 */
-    fxHeldCount: Int = 0,
+    /** 用户配置里开着几项（0..3），用于「还没起播」的判断 */
     fxWantedCount: Int = 0,
-    onReattachFx: () -> Unit = {},
+    /** 处理器接进管线后的采样率；0 = 还没起播 */
+    fxSampleRate: Int = 0,
     sleepTotalMin: Int = 0,
     sleepRemainingSec: Int = 0,
     onSleepChange: (Int) -> Unit = {},
@@ -743,8 +735,8 @@ fun ProfileScreen(
             SettingSwitchRow(
                 title = "均衡器",
                 subtitle = when {
-                    !eqEnabled -> "关闭 · 打开后按预设调整频响，占 1 个系统音效位"
-                    eqPresets.isEmpty() -> "已开启 —— 预设列表会在开始播放后出现"
+                    !eqEnabled -> "关闭 · 打开后按预设调整频响（十段，不占系统音效位）"
+                    eqPresets.isEmpty() -> "已开启"
                     else -> "已开启 · 正在按「${eqPresets.getOrNull(eqPreset) ?: "原声"}」调整频响"
                 },
                 checked = eqEnabled,
@@ -828,91 +820,72 @@ fun ProfileScreen(
         }
         }
 
-        // 均衡器没挂上时留一行说明（有频段时上面的块已经展示）
-        if (eqBands.isEmpty() && (eqStarved || fxStarved)) {
+        // 防御：频段是内置的，正常不会为空。真为空说明初始化没跑完。
+        if (eqBands.isEmpty()) {
             item { SectionHeader(text = "音效", modifier = Modifier.padding(top = 16.wdp)) }
+            item { SettingRow(title = "均衡器", subtitle = "加载中", onClick = {}) }
+        }
+
+        // ── 增强音效 ──
+        // v2.3.5：三项都在自研处理器里，没有「本机不支持」也没有「资源占用」，
+        // 所以这里不再需要按可用性隐藏或置灰 —— 一律常显、一律可调。
+        item { SectionHeader(text = "增强音效", modifier = Modifier.padding(top = 16.wdp)) }
+
+        item {
+            SettingRow(
+                title = "低音增强",
+                subtitle = if (fxBass <= 0) {
+                    "关 · 110Hz 以下整体抬升，中频不动"
+                } else {
+                    strengthLabel(fxBass) + " · 110Hz 以下整体抬升，中频不动"
+                },
+                onClick = { fxBassExpanded = !fxBassExpanded }
+            )
+        }
+        if (fxBassExpanded) {
             item {
-                SettingRow(
-                    title = "均衡器",
-                    subtitle = if (eqStarved) "资源占用，可重挂" else "不可用",
-                    onClick = {}
+                InlineOptions(
+                    options = STRENGTH_STEPS,
+                    selected = fxBass.toString(),
+                    onPick = { onFxBassChange(it.toInt()); fxBassExpanded = false }
                 )
             }
         }
 
-        // ── 增强音效 ──
-        // 两项一律列出：不可用的灰掉并写明原因，不做「不支持就消失」——
-        // 消失会让人以为功能被砍，而且同一台机器上还会时有时无（effect 池满了）。
-        if (fxBassAvailable || fxLoudnessAvailable || fxStarved) {
-            item { SectionHeader(text = "增强音效", modifier = Modifier.padding(top = 16.wdp)) }
-
+        item {
+            SettingRow(
+                title = "响度增强",
+                subtitle = if (fxLoudness <= 0) {
+                    "关 · 抬整体音量，EQ 正增益会先扣掉同等余量"
+                } else {
+                    "+${fxLoudness / 100} dB · EQ 正增益会先扣掉同等余量"
+                },
+                onClick = { fxLoudExpanded = !fxLoudExpanded }
+            )
+        }
+        if (fxLoudExpanded) {
             item {
-                SettingRow(
-                    title = "低音增强",
-                    subtitle = when {
-                        fxBassStarved -> "资源占用，可重挂"
-                        !fxBassAvailable -> "本机不支持"
-                        fxBass <= 0 -> "关 · 抬 60/230Hz 的低频，中频不动"
-                        else -> strengthLabel(fxBass) + " · 抬 60/230Hz 的低频，中频不动"
-                    },
-                    onClick = { if (fxBassAvailable && !fxBassStarved) fxBassExpanded = !fxBassExpanded }
+                InlineOptions(
+                    options = LOUD_STEPS,
+                    selected = fxLoudness.toString(),
+                    onPick = { onFxLoudnessChange(it.toInt()); fxLoudExpanded = false }
                 )
             }
-            if (fxBassAvailable && fxBassExpanded) {
-                item {
-                    InlineOptions(
-                        options = STRENGTH_STEPS,
-                        selected = fxBass.toString(),
-                        onPick = { onFxBassChange(it.toInt()); fxBassExpanded = false }
-                    )
-                }
-            }
+        }
 
-            item {
-                SettingRow(
-                    title = "响度增强",
-                    subtitle = when {
-                        fxLoudnessStarved -> "资源占用，可重挂"
-                        !fxLoudnessAvailable -> "本机不支持"
-                        fxLoudness <= 0 -> "关 · 抬整体音量，EQ 正增益会先扣掉同等余量"
-                        else -> "+${fxLoudness / 100} dB · EQ 正增益会先扣掉同等余量"
-                    },
-                    onClick = { if (fxLoudnessAvailable && !fxLoudnessStarved) fxLoudExpanded = !fxLoudExpanded }
-                )
-            }
-            if (fxLoudnessAvailable && fxLoudExpanded) {
-                item {
-                    InlineOptions(
-                        options = LOUD_STEPS,
-                        selected = fxLoudness.toString(),
-                        onPick = { onFxLoudnessChange(it.toInt()); fxLoudExpanded = false }
-                    )
-                }
-            }
-
-            if (fxStarved) {
-                item {
-                    SettingRow(
-                        title = "重挂音效链",
-                        subtitle = "系统音效资源被占满时，点此重新申请",
-                        onClick = onReattachFx
-                    )
-                }
-            }
-            item {
-                Text(
-                    text = when {
-                        fxHeldCount == 0 && fxWantedCount > 0 ->
-                            "当前占用 0 项系统音效资源（暂停中已暂时归还；按播放会重新申请）"
-                        fxHeldCount == 0 -> "当前占用 0 项系统音效资源（全部关闭，池位已归还系统）"
-                        else -> "当前占用 $fxHeldCount 项系统音效资源（关掉的项不占位）"
-                    },
-                    color = moyinColors().t3,
-                    fontSize = 11.wsp,
-                    lineHeight = 17.wsp,
-                    modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
-                )
-            }
+        item {
+            Text(
+                text = if (fxSampleRate > 0) {
+                    "音效跑在播放链上（${fxSampleRate / 1000f} kHz），不占系统音效槽 ——" +
+                        "开几项都不会影响别的 App。"
+                } else {
+                    "音效跑在播放链上，不占系统音效槽 —— 开几项都不会影响别的 App。"
+                },
+                color = moyinColors().t3,
+                fontSize = 11.wsp,
+                lineHeight = 17.wsp,
+                modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
+            )
         }
 
         }

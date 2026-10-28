@@ -58,11 +58,29 @@ class AudioRenderersFactory(
         enableAudioTrackPlaybackParams: Boolean
     ): AudioSink {
         val builder = DefaultAudioSink.Builder(context)
-            .setEnableFloatOutput(enableFloatOutput)
+            // ⚠️ float 输出固定关掉，**不透传** DefaultRenderersFactory 的设置。
+            // media3 1.7.1 的 `DefaultAudioSink.configure()` 里 float 输出走另一条分支，
+            // 那条分支**不插入 audioProcessorChain**（只有 int 分支插）。一旦开了 float，
+            // 高解析源（24/32bit/flac）就会绕过我们这条 EQ 链 —— 表现为
+            // 「某些歌有效果、某些歌没有」，是最难查的那种 bug。
+            // 代价：内部按 16bit 整数处理，biquad 中间态精度略降。
+            // 播放器（不是母带工作站）这个取舍可以接受；真出问题也是「精度差一点」，
+            // 而不是「功能时有时无」。
+            .setEnableFloatOutput(false)
             .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
         if (!allowOffload) {
+            // 自研十段 EQ / 低音 / 响度，全部挂在 PCM 管线上，不占系统音效池位。
+            // 传进去的处理器会排在 ToInt16/ChannelMapping/Trimming 之后、
+            // 静音跳过与变速（Sonic）之前 —— 顺序由 DefaultAudioProcessorChain 保证。
+            builder.setAudioProcessors(arrayOf(EqProcessor.instance))
+            // 有处理器在链上时 media3 本来就不会走 offload，这条是显式声明，
+            // 防止将来 media3 改了判定顺序后悄悄直通、把音效绕过去。
             builder.setAudioOffloadSupportProvider { _, _ -> AudioOffloadSupport.DEFAULT_UNSUPPORTED }
         }
+        // allowOffload = 用户选了省电播放：**不挂处理器**，让 media3 真走 DSP 直通。
+        // 如果这时仍挂着处理器，offload 会被抑制（getAudioProcessors() 非空即不走），
+        // 开关就变成「只是把音效关掉，还骗人说是省电」—— 语义不彻底，不如不挂。
+        // 代价是音效真的没了，这也正是开关上写明的事。
         return builder.build()
     }
 

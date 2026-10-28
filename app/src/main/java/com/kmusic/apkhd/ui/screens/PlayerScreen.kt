@@ -61,6 +61,7 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kmusic.apkhd.model.LyricLine
+import com.kmusic.apkhd.playback.FxChain
 import com.kmusic.apkhd.model.PlayMode
 import com.kmusic.apkhd.model.Track
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -202,22 +203,19 @@ fun PlayerScreen(
     onFxLoudnessChange: (Int) -> Unit = {},
     fxBassAvailable: Boolean = false,
     fxLoudnessAvailable: Boolean = false,
-    /** 有项目是因为 effect 池被占满（而不是本机没有）才不可用 —— 可重挂恢复 */
-    fxStarved: Boolean = false,
-    eqStarved: Boolean = false,
     /** 正在播 DSD（音效面板据此提示「均衡器已自动旁路」） */
     dsdPlaying: Boolean = false,
     /** DSD 倍率标签 */
     dsdLabel: String? = null,
     /** 用户是否开启了 DSD 自动旁路 EQ */
     dsdBypassEq: Boolean = true,
-    fxBassStarved: Boolean = false,
-    fxLoudnessStarved: Boolean = false,
-    /** 本 App 此刻实际占用的系统音效池位数 */
-    fxHeldCount: Int = 0,
+    /** 用户配置里开着几项（0..3）—— 用来区分「全关」和「还没起播」 */
     fxWantedCount: Int = 0,
-    onReattachFx: () -> Unit = {},
-    /** 省电播放（offload）已开：音效全部不可用 */
+    /** 处理器接进管线后的采样率；0 = 还没起播 */
+    fxSampleRate: Int = 0,
+    /** 让给 EQ 正增益峰值的前级余量（dB） */
+    fxHeadroomDb: Float = 0f,
+    /** 省电播放（offload）已开：PCM 直通 DSP，音效不可用 */
     audioOffload: Boolean = false,
     // 音频信息 + AI 导赏
     audioInfo: AudioInfo? = null,
@@ -775,14 +773,9 @@ fun PlayerScreen(
                 fxLoudness = fxLoudness, onFxLoudnessChange = onFxLoudnessChange,
                 fxBassAvailable = fxBassAvailable,
                 fxLoudnessAvailable = fxLoudnessAvailable,
-                fxStarved = fxStarved,
-                eqStarved = eqStarved,
-                fxBassStarved = fxBassStarved,
-                fxLoudnessStarved = fxLoudnessStarved,
-                fxHeldCount = fxHeldCount,
                 fxWantedCount = fxWantedCount,
-                onReattachFx = onReattachFx,
-                paused = !isPlaying,
+                fxSampleRate = fxSampleRate,
+                fxHeadroomDb = fxHeadroomDb,
                 audioOffload = audioOffload,
                 dsdPlaying = dsdPlaying,
                 dsdLabel = dsdLabel,
@@ -1458,16 +1451,12 @@ private fun EffectSheet(
     fxLoudness: Int, onFxLoudnessChange: (Int) -> Unit,
     fxBassAvailable: Boolean,
     fxLoudnessAvailable: Boolean,
-    fxStarved: Boolean,
-    eqStarved: Boolean,
-    fxBassStarved: Boolean,
-    fxLoudnessStarved: Boolean,
-    /** 本 App 此刻实际占用的系统音效池位数 */
-    fxHeldCount: Int = 0,
+    /** 用户配置里开着几项（0..3） */
     fxWantedCount: Int = 0,
-    onReattachFx: () -> Unit,
-    /** 暂停/停止中：App 会把池位归还，状态说明要能区分于「全关」 */
-    paused: Boolean = false,
+    /** 处理器接进管线后的采样率；0 = 还没起播 */
+    fxSampleRate: Int = 0,
+    /** 让给 EQ 正增益峰值的前级余量（dB） */
+    fxHeadroomDb: Float = 0f,
     audioOffload: Boolean,
     /** 正在播 DSD（音效面板据此提示「均衡器已自动旁路」） */
     dsdPlaying: Boolean = false,
@@ -1554,28 +1543,24 @@ private fun EffectSheet(
             }
             Spacer(Modifier.height(6.wdp))
 
-            // ── A4 · 三态说明 ──
-            // 以前只有「当前占用：N 项」——回答的是池位，不是用户真正想知道的
-            // 「我听到的效果生效了吗，没生效是为什么」。判定逻辑在 FxStatus 里可单测。
+            // ── 状态说明 ──
+            // 这一行回答的必须是用户真正关心的问题：「我听到的效果生效了吗？
+            // 没生效是为什么？」—— 不是内部概念。判定逻辑在 FxStatus 里可单测。
             run {
-                val wanted = (if (eqEnabled) 1 else 0) +
-                    (if (fxBass > 0) 1 else 0) +
-                    (if (fxLoudness > 0) 1 else 0)
-                // headroom / 实际响度就地算：这两个值只用于解释文案，
-                // 从 AudioEffectHolder 读是普通字段（非 Compose state），读了也不会重组，
-                // 反而会出现「文案跟曲线不同步」。
-                val peakDb = (eqBands.maxOrNull() ?: 0).coerceAtLeast(0) / 100f
                 val requestedDb = fxLoudness / 100f
-                val appliedDb = (requestedDb - peakDb).coerceIn(-12f, 12f)
+                // 上下限与 FxChain.inputGainDb() 共用同一对常量 —— 界面显示的增益
+                // 必须与处理器实际用的完全一致，但这里保持纯计算（FxChain 的实时值
+                // 不是 Compose 快照状态，直接读会拿到过期值）。
+                val appliedDb = (requestedDb - fxHeadroomDb)
+                    .coerceIn(FxChain.INPUT_GAIN_MIN_DB, FxChain.INPUT_GAIN_MAX_DB)
                 val status = FxStatus.resolve(
                     offload = audioOffload,
                     dsdPlaying = dsdPlaying,
                     dsdBypassEq = dsdBypassEq,
-                    wanted = wanted,
-                    held = fxHeldCount,
-                    starved = fxStarved,
-                    paused = paused,
-                    headroomDb = peakDb,
+                    wanted = fxWantedCount,
+                    attached = fxSampleRate > 0,
+                    sampleRateHz = fxSampleRate.takeIf { it > 0 },
+                    headroomDb = fxHeadroomDb,
                     loudnessAppliedDb = appliedDb,
                     loudnessRequestedDb = requestedDb
                 )
@@ -1586,14 +1571,46 @@ private fun EffectSheet(
                         if (status.loudnessRequestedDb > 0f &&
                             status.loudnessAppliedDb + 0.1f < status.loudnessRequestedDb
                         ) {
-                            sb.append(
-                                " · 响度实际 +${"%.1f".format(status.loudnessAppliedDb)} dB" +
-                                    "（设定 +${"%.0f".format(status.loudnessRequestedDb)} dB，" +
-                                    "其余让给 EQ 余量）"
-                            )
+                            // 符号统一走 signedDb：曲线要的余量比响度还多时实际值会是负数，
+                            // 手写 "+" 会拼出「+-7.8 dB」（实测就是这么出现的）。
+                            //
+                            // 实际为负时**不能**只说「其余让给 EQ 余量」—— 那听起来像是
+                            // 「少加了一点」，而实际是整机被压低。必须把因果关系说反过来说：
+                            // 是这条曲线要的余量比响度还大，所以整体被压到负值。
+                            val applied = status.loudnessAppliedDb
+                            if (applied < -0.05f) {
+                                // 余量可能来自两条曲线（EQ 正增益 + 低音搁架），
+                                // 不能只写「当前曲线」—— EQ 关着、低音开着时那句话是错的指引。
+                                val need = when {
+                                    fxBass > 0 && eqEnabled -> "EQ+低音"
+                                    fxBass > 0 -> "低音"
+                                    else -> "EQ"
+                                }
+                                // 面板宽度有限（横屏约 330dp），必须压成一行：
+                                // 全称「响度设定 +9 dB，但 EQ 曲线与低音要 16.8 dB 余量…」会折成两行，
+                                // 把下面的开关挤下去。语义仍完整：谁要的余量、整体实际多少。
+                                sb.append(
+                                    " · 响度 +${"%.0f".format(status.loudnessRequestedDb)} dB" +
+                                        " 被 ${need} 的 ${
+                                            "%.1f".format(status.headroomDb)
+                                        } dB 余量抵掉，实际 ${signedDb(applied)} dB" +
+                                        if (applied <= FxChain.INPUT_GAIN_MIN_DB + 0.05f) {
+                                            "（余量已吃满前级下限，请减小提升量）"
+                                        } else {
+                                            ""
+                                        }
+                                )
+                            } else {
+                                sb.append(
+                                    " · 响度实际 ${signedDb(applied)} dB" +
+                                        "（设定 +${"%.0f".format(status.loudnessRequestedDb)} dB，" +
+                                        "其余让给 EQ 余量）"
+                                )
+                            }
                         } else if (status.headroomDb > 0.05f) {
                             sb.append(" · 为 EQ 让出 ${"%.1f".format(status.headroomDb)} dB 余量")
                         }
+                        status.sampleRateHz?.let { sb.append(" · ${it / 1000f} kHz") }
                         sb.toString() to c.t2
                     }
                     is FxStatus.Bypassed -> when (status.reason) {
@@ -1602,12 +1619,10 @@ private fun EffectSheet(
                         FxStatus.Bypassed.Reason.DSD ->
                             "已旁路：DSD 解码中（设置已保留）" to c.t3
                         FxStatus.Bypassed.Reason.ALL_OFF ->
-                            "三项全关，未占用系统音效" to c.t3
+                            "三项全关" to c.t3
                     }
-                    FxStatus.PoolStarved ->
-                        "资源占用：系统音效槽被其它 App 占满，暂停后会自动重试" to c.t3
-                    FxStatus.Suspended ->
-                        "已配置，暂停中已暂时归还音效槽（继续播放会重新挂上）" to c.t3
+                    FxStatus.Waiting ->
+                        "已配置，起播后立刻生效（音效跑在播放链上，不占系统音效槽）" to c.t3
                     FxStatus.Idle -> "全部关闭" to c.t3
                 }
                 Text(
@@ -1623,7 +1638,7 @@ private fun EffectSheet(
                 // offload 时整条音效链都没挂上 —— 与其显示一堆点了没反应的开关，不如说清楚
                 Text(
                     "省电播放已开启：音频直通 DSP，均衡器与全部音效不可用。" +
-                        "关闭「省电播放」后重启起播即可恢复。",
+                        "关闭「省电播放」后重新起播即可恢复。",
                     color = c.t3,
                     fontSize = 12.wsp,
                     lineHeight = 18.wsp,
@@ -1647,12 +1662,10 @@ private fun EffectSheet(
 
             // 均衡器同样不做「挂不上就整块消失」：
             // 没频段时留一行说明，让用户知道是资源/设备问题，不是 App 没这个功能。
+            // v2.3.5 起频段是内置的，eqBands 不会为空；这段留作防御 ——
+            // 真为空说明初始化没跑完，说「加载中」比说「不支持」准确。
             if (eqBands.isEmpty()) {
-                EffectRow(
-                    "均衡器",
-                    if (eqStarved) "资源占用" else "本机不支持",
-                    arrow = false
-                ) { }
+                EffectRow("均衡器", "加载中", arrow = false) { }
             }
             if (eqBands.isNotEmpty()) {
                 val eqBypassed = dsdPlaying && dsdBypassEq
@@ -1765,9 +1778,9 @@ private fun EffectSheet(
             // 用户会以为功能被删了 —— 功能缺失和功能不可用必须在界面上分得清。
             FxRow(
                 title = "低音增强",
-                value = if (fxBassAvailable) fxStrengthLabel(fxBass) else "不可用",
-                available = fxBassAvailable && !audioOffload && !fxBassStarved,
-                starved = fxBassStarved,
+                value = fxStrengthLabel(fxBass),
+                available = !audioOffload,
+                starved = false,
                 expanded = expanded == "bass",
                 onClick = { expanded = if (expanded == "bass") null else "bass" }
             ) {
@@ -1775,33 +1788,22 @@ private fun EffectSheet(
             }
             FxRow(
                 title = "响度增强",
-                value = if (fxLoudnessAvailable) {
-                    if (fxLoudness <= 0) "关" else "+${fxLoudness / 100} dB"
-                } else "不可用",
-                available = fxLoudnessAvailable && !audioOffload && !fxLoudnessStarved,
-                starved = fxLoudnessStarved,
+                value = if (fxLoudness <= 0) "关" else "+${fxLoudness / 100} dB",
+                available = !audioOffload,
+                starved = false,
                 expanded = expanded == "loud",
                 onClick = { expanded = if (expanded == "loud") null else "loud" }
             ) {
                 ChipRow(FX_LOUD_STEPS, fxLoudness.toString()) { onFxLoudnessChange(it.toInt()) }
             }
 
-            // 手动「重挂音效链」入口已移除。
-            // 理由：用户点它十次有九次没反应（池位回收是异步的，重建必然再失败），
-            // 反而让人以为功能坏了。现在改成**失败自动退避重试**（见 MoyinPlaybackService），
-            // 抢得回来就自己抢回来，抢不回来就是本机不支持 —— 不需要用户操心。
-
-            // 池位占用：把「关掉的项到底占不占地方」直接摊开说。
-            // 这一行是这一版的核心承诺 —— 全关 = 0 项，开一项 = 1 项。
+            // 池位占用那行已经删掉了（v2.3.5）：音效跑在播放链上，
+            // 无论开几项都**不占系统音效槽**。继续写「占用 N 项」反而会让人以为
+            // 还是老机制、还得操心池位。这里只留一句事实。
             if (!audioOffload) {
                 Text(
-                    when {
-                        // 有开关打开、但池位为 0 = 暂停超时后已归还，不能写成"全部关闭"（那是在撒谎）
-                        fxHeldCount == 0 && fxWantedCount > 0 ->
-                            "当前占用：0 项系统音效（暂停中已暂时归还，按播放会重新申请）"
-                        fxHeldCount == 0 -> "当前占用：0 项系统音效（全部关闭，池位已归还）"
-                        else -> "当前占用：$fxHeldCount 项系统音效"
-                    },
+                    "均衡器 / 低音 / 响度都跑在播放链上，不占系统音效槽 —— " +
+                        "开几项都不会影响别的 App，也不会有「资源被占满」。",
                     color = c.t3,
                     fontSize = 11.wsp,
                     lineHeight = 17.wsp,
@@ -1845,6 +1847,17 @@ private fun EffectSheet(
             )
         }
     }
+}
+
+/**
+ * 带符号保留一位小数：`+3.1` / `-7.8` / `0.0`。
+ *
+ * 不能写成 `"+${"%.1f".format(v)}"` —— 值为负时会拼出「+-7.8」，
+ * 这在响度被 EQ 余量吃成负数时是常态，不是边界。
+ */
+private fun signedDb(v: Float): String {
+    val rounded = String.format(java.util.Locale.US, "%.1f", v)
+    return if (v > 0.05f) "+$rounded" else rounded
 }
 
 @Composable

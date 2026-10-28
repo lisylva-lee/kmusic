@@ -11,7 +11,6 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
-import com.kmusic.apkhd.AppVisibility
 import com.kmusic.apkhd.crypto.QmcV2Rc4
 import com.kmusic.apkhd.audio.DsdExtractor
 import com.kmusic.apkhd.data.DiagLog
@@ -51,22 +50,14 @@ class MoyinPlaybackService : MediaSessionService() {
 
     private var session: MediaSession? = null
 
-    /** 播放器实例（class 字段，供音效链调度使用） */
+    /** 播放器实例（class 字段，供 DSD 状态同步使用） */
     private var player: ExoPlayer? = null
 
-    /** offload（省电直通）是否开启 —— 开了就不挂音效链 */
+    /** offload（省电直通）是否开启 —— 开了 PCM 不过本进程，音效随之失效 */
     private var offload: Boolean = false
 
     /** DSD 播放时是否自动旁路均衡器（用户设置，默认开） */
     private var dsdBypassEq: Boolean = true
-
-    companion object {
-        /** 空闲多久后拆音效链（毫秒）。给「刚暂停 / 刚切走」留缓冲。 */
-        const val FX_RELEASE_DELAY_MS = 15_000L
-    }
-
-    /** 前后台变化回调句柄，onDestroy 时反注册 */
-    private var visibilityHandle: (() -> Unit)? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -76,55 +67,14 @@ class MoyinPlaybackService : MediaSessionService() {
             DsdPlaybackState.update(true, label)
         }
 
-        // DSD 播放状态变化 → 音效链旁路/恢复均衡器
+        // DSD 播放状态变化 → 处理器切透传 / 恢复。
+        //
+        // v2.3.5 起这只是一次 flag 写入（EqProcessor.isBypassed），不拆管线、不重建：
+        // 旧的 AudioEffect 链在 DSD 上要 release 再 attach，切歌会有几百毫秒的空窗；
+        // 现在处理器始终在链上，只是那几帧不做浮点运算。
         DsdPlaybackState.setListener {
             val bypass = dsdBypassEq && DsdPlaybackState.isDsdPlaying
-            AudioEffectHolder.setDsdBypass(bypass)
-        }
-
-        // 用户动了音效（开关 / 滑块 / 档位）→ 这里收尾。
-        //
-        // 两件事必须做，少一件就变成「开关只管一半」：
-        // ① 暂停 15 秒后整条链已被拆（attachedSessionId=0），此时 holder 里所有 ensureXxx
-        //    都因为没有 session 直接 return —— 不改就是"拖了没反应"，必须用当前 session 重新挂；
-        // ② 重新挂上之后仍在"没在播"状态，得把 15 秒释放计时重新装上，不能一直白占池位。
-        AudioEffectHolder.onUserConfigChanged = {
-            val id = player?.audioSessionId ?: 0
-            if (id > 0 && !AudioEffectHolder.isAttached(id)) {
-                AudioEffectHolder.attach(id)
-                if (AudioEffectHolder.attached) {
-                    AudioEffectHolder.clearReleasedFlag()
-                    DiagLog.log("EQ", "用户改音效 → 重建音效链 session=$id")
-                }
-            }
-            scheduleFxRelease()
-        }
-
-        // 前后台切换都要评估：
-        // - 退到后台：判断是否该拆（配合 isPlaying）
-        // - 回到前台：如果之前拆过，这里负责重建音效链
-        //   （不回前台重建的话，用户切回来听歌会发现 EQ/低音全没了，
-        //    要等下一次切歌 READY 才恢复 —— 表现为"音效时有时无"）
-        visibilityHandle = AppVisibility.addListener { foreground ->
-            if (!foreground) {
-                DiagLog.log("EQ", "退到后台 → 开始计时（${FX_RELEASE_DELAY_MS / 1000}s 后评估释放）")
-                scheduleFxRelease()
-            } else if (AudioEffectHolder.releasedForBackground && player?.isPlaying == true) {
-                // 回前台 + 在播 才重建。只是切回来看看界面（没在播）不该白占池位 ——
-                // 等用户真按下播放时 onIsPlayingChanged 会负责重建。
-                val id = player?.audioSessionId ?: 0
-                if (id > 0) {
-                    AudioEffectHolder.attach(id)
-                    if (AudioEffectHolder.attached) {
-                        DiagLog.log("EQ", "回到前台 → 重建音效链 session=$id")
-                    } else {
-                        // 池位可能被别的进程刚占住 —— 交给自动重试，用户不该看到这个
-                        DiagLog.log("EQ", "回到前台 → 首次重建未成功，转自动重试 session=$id")
-                        AudioEffectHolder.scheduleAutoRetry(id)
-                    }
-                    AudioEffectHolder.clearReleasedFlag()
-                }
-            }
+            FxChain.setDsdBypass(bypass)
         }
 
         // 播放缓存：容量来自设置（0=关闭，默认 1GB）。
@@ -135,15 +85,16 @@ class MoyinPlaybackService : MediaSessionService() {
                 withTimeoutOrNull(800) { SettingsStore(this@MoyinPlaybackService).cacheSizeGb.first() }
             }
         }.getOrNull() ?: 1
-        // offload：默认关。开了之后 EQ/低音/环绕全部失效（设备直通 DSP 不经音效链），
+        // offload：默认关。开了之后 PCM 直通 DSP，本进程的均衡器/低音/响度全部失效，
         // 所以它只能是个显式开关，不能默认替用户选。
         offload = runCatching {
             runBlocking {
                 withTimeoutOrNull(800) { SettingsStore(this@MoyinPlaybackService).audioOffload.first() }
             }
         }.getOrNull() ?: false
+        FxChain.setOffload(offload)
         if (offload) {
-            DiagLog.log("AUDIO", "offload 已开启：音效链本次不挂载")
+            DiagLog.log("AUDIO", "offload 已开启：PCM 直通 DSP，音效本次不生效")
         }
         // DSD 输出采样率：44100（默认）/ 88200。
         // 读取方式和 offload 一样 —— 800ms 兜底，读不到就用默认值，绝不阻塞起播。
@@ -154,7 +105,7 @@ class MoyinPlaybackService : MediaSessionService() {
         }.getOrNull() ?: 44100
         DiagLog.log("DSD", "DSD 输出采样率：$dsdOutRate Hz")
 
-        // DSD 自动旁路 EQ：默认开。读了立刻同步到音效链（可能在 onCreate 之前就播过）
+        // DSD 自动旁路 EQ：默认开。读了立刻同步到处理器（可能在 onCreate 之前就播过）
         dsdBypassEq = runCatching {
             runBlocking {
                 withTimeoutOrNull(800) { SettingsStore(this@MoyinPlaybackService).dsdBypassEq.first() }
@@ -192,64 +143,28 @@ class MoyinPlaybackService : MediaSessionService() {
             .build()
         player = p
 
-        // 均衡器挂在真实的 audio session 上 —— session 要等播放器建出音频轨才有，
-        // 所以只能用这个回调拿（提前 setAudioSessionId 再挂，可能在 session
-        // 还不存在时失败，表现为「均衡器静默无效」）
         p.addListener(object : Player.Listener {
-            override fun onAudioSessionIdChanged(audioSessionId: Int) {
-                // offload 直通 DSP，AudioEffect 挂上去也不会生效，反而让人以为「开了没效果」
-                if (offload) return
-                AudioEffectHolder.attach(audioSessionId)
-                // DSD 旁路状态也要跟着 attach 走 —— 挂在 session 上之前先设好，
-                // 否则第一次 apply 时 EQ 会被打开，DSD 播放中又要多跑一条 EQ
-                AudioEffectHolder.setDsdBypass(dsdBypassEq && DsdPlaybackState.isDsdPlaying)
-                // 冷启动时会话就分配好了、但用户还没点播放 —— 这时 attach 建的链
-                // 没有任何人排释放计划，会一直白占池位（实测：冷启动不播 = 常驻 1 项）。
-                scheduleFxRelease()
-            }
-
-            /**
-             * 再补一条兜底。
-             *
-             * onAudioSessionIdChanged 在某些 ROM 上不会在首次起播时回调（session 是复用的，
-             * id 没有「变化」），音效链就永远挂不上 —— 表现就是「均衡器只有开关」。
-             * 播放器就绪时主动读一次当前 session id，没挂过就挂上。
-             */
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState != Player.STATE_READY) return
-                if (offload) return
-                val id = p.audioSessionId
-                // ⚠️ 只在「准备要播」时补挂：暂停状态下 seek/缓冲也会走到 STATE_READY，
-                // 若不加这道闸，刚被空闲释放的链会被重新抢回来，池位白占。
-                if (id > 0 && !AudioEffectHolder.isAttached(id) && p.playWhenReady) {
-                    AudioEffectHolder.attach(id)
-                    scheduleFxRelease()
-                }
-            }
-
-            /**
-             * 播放状态一变就重新评估「要不要拆音效链」。
-             *
-             * 见 [AudioEffectHolder.releaseForBackground]：进程被杀时 AudioEffect
-             * 的 native handle 永不 release，会在 AudioFlinger 里留下永久占位的孤儿链，
-             * 漏几十次之后 effect 池就满了，音效项成片消失。
-             */
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                scheduleFxRelease()
-            }
-
-            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-                scheduleFxRelease()
-            }
-
             /**
              * 切歌时更新「当前是不是 DSD」。
              *
-             * DSD 播放要自动旁路均衡器（解码链已经吃满 CPU，再挂 EQ 会挤掉音频线程），
-             * 所以音效链必须知道现在播的是不是 DSD。
+             * DSD 播放要自动旁路均衡器（解码链已经吃满 CPU，再跑十个 biquad 会挤掉音频线程），
+             * 所以处理器必须知道现在播的是不是 DSD。
              */
             override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
                 updateDsdState(p)
+            }
+
+            /**
+             * 处理器接进管线后采样率才知道（由它自己上报）。
+             * 就绪时打一行日志当验收锚点 —— 有这行就说明 AudioProcessor 真的上链了。
+             */
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState != Player.STATE_READY) return
+                val proc = EqProcessor.instance
+                DiagLog.log(
+                    "EQ",
+                    "播放就绪：处理器 ${proc.currentSampleRate}Hz 生效=${proc.working} 旁路=${proc.isBypassed}"
+                )
             }
         })
 
@@ -281,58 +196,6 @@ class MoyinPlaybackService : MediaSessionService() {
         if (!isDsd) DsdPlaybackState.update(false, null)
     }
 
-    // ── 音效链后台释放 ──
-
-    /**
-     * 空闲时把音效链拆掉，把全局 effect 池位还给系统。
-     *
-     * 判定条件（两条同时满足才拆）：
-     * 1. **当前没有在播**（`!player.isPlaying`）—— 正在播歌时绝不拆，
-     *    否则用户切到别的 App 继续听，音效就没了；
-     * 2. 已经空闲满 15 秒 —— 给「暂停一下马上继续」留出缓冲，不做急刹。
-     *
-     * 为什么不再要求「App 在后台」：暂停着的音效链对它没有任何意义。
-     * 以前只有退到后台才拆，于是「前台暂停 → 熄火下车」这条路上，
-     * 一条没在用的链会一直挂到进程被杀。
-     *
-     * 拆完只留配置（存在 [AudioEffectHolder] 的 pendingRestore 里），
-     * 下次真正起播时 attach 自动恢复 —— 用户不用重新调一遍。
-     */
-    private fun scheduleFxRelease() {
-        if (offload) return
-        val p = player ?: return
-        if (p.isPlaying) {
-            // 在播 → 取消释放计划；之前拆过就顺手重建
-            if (AudioEffectHolder.releasedForBackground) {
-                val id = p.audioSessionId
-                if (id > 0) {
-                    AudioEffectHolder.attach(id)
-                    // attach 之后必须清标记：不清的话 onIsPlayingChanged / onPlayWhenReadyChanged
-                    // 会各走一次重建分支（实测同一次起播打两条同样的日志）
-                    if (AudioEffectHolder.attached) AudioEffectHolder.clearReleasedFlag()
-                    DiagLog.log("EQ", "开始播放 → 重建音效链 session=$id")
-                }
-            }
-            fxReleaseRunnable?.let { handler.removeCallbacks(it) }
-            fxReleaseRunnable = null
-            return
-        }
-        // 没在播（前台后台都算）→ 15 秒后拆
-        if (fxReleaseRunnable != null) return
-        val runnable = Runnable {
-            fxReleaseRunnable = null
-            val pp = player ?: return@Runnable
-            if (pp.isPlaying) return@Runnable
-            val id = pp.audioSessionId
-            if (id > 0) AudioEffectHolder.releaseForBackground(id)
-        }
-        fxReleaseRunnable = runnable
-        handler.postDelayed(runnable, FX_RELEASE_DELAY_MS)
-    }
-
-    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
-    private var fxReleaseRunnable: Runnable? = null
-
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
 
     /** 用户从最近任务划掉 App：没在播就收摊，在播就继续（后台听歌不该被划掉打断） */
@@ -344,17 +207,14 @@ class MoyinPlaybackService : MediaSessionService() {
     }
 
     override fun onDestroy() {
-        visibilityHandle?.invoke()
-        visibilityHandle = null
-        fxReleaseRunnable?.let { handler.removeCallbacks(it) }
-        fxReleaseRunnable = null
         session?.run {
             player.release()
             release()
         }
         session = null
         KuwoCipherHolder.clear()
-        AudioEffectHolder.release()
+        // 处理器不占任何系统资源，这里只是把参数清零，避免下次意外沿用
+        FxChain.release()
         super.onDestroy()
     }
 }
