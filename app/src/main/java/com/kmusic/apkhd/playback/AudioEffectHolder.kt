@@ -55,16 +55,16 @@ object AudioEffectHolder {
      * 合并进 DP 之后没有芯片原厂的 usePreset() 了（DP 根本没有预设 API），
      * 预设改成自存的增益表 —— 音色接近，但不是原厂曲线。
      */
-    private val PRESET_NAMES = listOf("原声", "流行", "摇滚", "古典", "人声", "低音", "高音")
-    private val PRESETS = arrayOf(
-        intArrayOf(0, 0, 0, 0, 0),
-        intArrayOf(-100, 200, 400, 200, -100),
-        intArrayOf(400, 150, -100, 200, 400),
-        intArrayOf(300, 100, -100, 150, 300),
-        intArrayOf(-200, 100, 500, 300, -100),
-        intArrayOf(600, 300, 0, -100, -200),
-        intArrayOf(-200, -100, 0, 300, 600)
-    )
+    /**
+     * 内置预设（5 段增益，mB）。
+     *
+     * v2.3.4 起预设表迁到 [EqPresets]（含分组与新增场景/设备预设），
+     * 这里保留字段名只为减少改动面；**前 7 项的曲线与顺序没变**，
+     * 老用户存的 `eq_preset` 下标继续指向同一条曲线。
+     */
+    private val PRESET_NAMES: List<String> get() = EqPresets.names()
+    private val PRESETS: List<IntArray> get() = EqPresets.builtIn().map { it.gains }
+    private val PRESET_COUNT: Int get() = EqPresets.builtInCount
 
     /** 音效链的用户配置快照（后台释放 → 重建时恢复） */
     data class FxSettings(
@@ -407,7 +407,7 @@ object AudioEffectHolder {
 
     /** 回到预设模式，丢掉已自定义频段 */
     fun usePresetMode(index: Int) {
-        presetIndex = index.coerceIn(0, PRESETS.size - 1)
+        presetIndex = index.coerceIn(0, PRESET_COUNT - 1)
         customBands = false
         manualLevels = emptyMap()
         // 选预设隐含「我要用均衡器」：不建实例的话选了没效果
@@ -417,8 +417,39 @@ object AudioEffectHolder {
         applyToDevice()
     }
 
-    /** 预设名（内置 7 套，与系统预设无关） */
-    fun presetNames(): List<String> = PRESET_NAMES
+    /** 预设名（内置 7 套 + 新增分组预设，见 [EqPresets]） */
+    fun presetNames(): List<String> = EqPresets.names()
+
+    /**
+     * 直接套用一条自定义曲线（用户预设 / 从别处恢复）。
+     *
+     * 和 [usePresetMode] 的区别：那条走 `presetIndex`，这条把 5 段全部写进
+     * `manualLevels` 并标记 custom —— 曲线是「用户自己的」，不该再被任何
+     * 内置预设覆盖。
+     */
+    fun applyCurve(gains: IntArray, presetIndexHint: Int = -1) {
+        val n = minOf(BAND_COUNT, gains.size)
+        if (n <= 0) return
+        val range = bandRange()
+        manualLevels = (0 until n).associateWith { b ->
+            gains[b].coerceIn(range[0], range[1])
+        }
+        customBands = true
+        // 命中内置曲线就把下标对回去，界面顶部才会显示预设名而不是「自定义」
+        val hit = EqPresets.builtIn().indexOfFirst { def ->
+            def.gains.size >= n && (0 until n).all { manualLevels[it] == def.gains[it] }
+        }
+        presetIndex = when {
+            presetIndexHint in 0 until PRESET_COUNT -> presetIndexHint
+            hit >= 0 -> hit
+            else -> presetIndex.coerceIn(0, PRESET_COUNT - 1)
+        }
+        idleReleased = false
+        enabled = true
+        ensureUnified(force = true)
+        applyToDevice()
+        DiagLog.log("EQ", "套用曲线 ${manualLevels.values.joinToString(",")}（预设 #$presetIndex）")
+    }
 
     /**
      * 老版本存的 eqPreset 是**设备预设下标**（0..9），现在换成了内置表。
@@ -427,9 +458,9 @@ object AudioEffectHolder {
      * 认不出来就落到「原声」。迁移完写标记，之后不再动用户的选择。
      */
     fun migratePresetIndex(oldIndex: Int): Int {
-        val prefs = eqCachePrefs() ?: return oldIndex.coerceIn(0, PRESETS.size - 1)
+        val prefs = eqCachePrefs() ?: return oldIndex.coerceIn(0, PRESET_COUNT - 1)
         if (prefs.getBoolean("preset_migrated_232", false)) {
-            return oldIndex.coerceIn(0, PRESETS.size - 1)
+            return oldIndex.coerceIn(0, PRESET_COUNT - 1)
         }
         val oldNames = prefs.getString("eq_presets", null)
             ?.split('\u0001')
@@ -986,10 +1017,45 @@ object AudioEffectHolder {
             }
             // 响度：前级抬高 + limiter 兜底。⚠️ 不能用 limiter 的 postGain ——
             // 它在限幅之后，加多少就削多少。
-            d.setInputGainAllChannelsTo(loudnessGain / 100f)
+            //
+            // ⚠️ 前级增益必须**先扣掉 EQ 的正增益峰值**（v2.3.4）：
+            // EQ 串在 limiter 之前，用户把 60Hz 拉 +12dB 再叠 +9dB 响度，
+            // 实际是 21dB 一起撞 limiter —— 听感是「闷 + 喘」而不是「更响」。
+            // 把 headroom 让出来，曲线才是线性的，响度才真的是响度。
+            d.setInputGainAllChannelsTo(effectiveInputGainDb())
             d.setLimiterAllChannelsTo(limiter())
         }.onFailure { Log.w(TAG, "应用统一音效失败: ${it.message}") }
     }
+
+    /**
+     * 前级增益（dB）= 用户响度 − 曲线正增益峰值。
+     *
+     * 只扣正增益，负增益不补（补了等于偷着加响度，用户看到的 dB 就不作数了）。
+     *
+     * **响度关着也要扣**（v2.3.4 修正）：以前 `loud<=0` 直接返回 0，
+     * 于是「响度关 + 60Hz 拉满 +12dB」照样把 +12dB 顶进 limiter，
+     * 表现是低频发糊、整体发闷 —— 用户以为低音增强就是这种声音。
+     * 现在允许扣成负数（等价于硬件 EQ 的 preamp），下限 −12dB 免得整曲变小。
+     */
+    private fun effectiveInputGainDb(): Float {
+        val loud = loudnessGain / 100f
+        val peak = effectiveGains().maxOrNull()?.coerceAtLeast(0) ?: 0
+        return (loud - peak / 100f).coerceIn(-12f, 12f)
+    }
+
+    /**
+     * 当前让给 EQ 的 headroom（dB，正数）。界面用它解释「为什么 +9dB 没有更响」。
+     */
+    val eqHeadroomDb: Float
+        get() {
+            if (!unifiedMode) return 0f
+            val peak = effectiveGains().maxOrNull()?.coerceAtLeast(0) ?: 0
+            return peak / 100f
+        }
+
+    /** 实际生效的前级增益（dB）。响度 0 时是 0 */
+    val inputGainDb: Float get() = if (unifiedMode) effectiveInputGainDb() else loudnessGain / 100f
+
 
     private fun applyLegacy() {
         legacyEq?.let { e ->
@@ -1031,7 +1097,7 @@ object AudioEffectHolder {
 
     fun configure(enabled: Boolean, presetIndex: Int) {
         this.enabled = enabled
-        val idx = presetIndex.coerceIn(0, PRESETS.size - 1)
+        val idx = presetIndex.coerceIn(0, PRESET_COUNT - 1)
         // ⚠️ 只有真的换了预设才丢掉自定义曲线。
         // 旧实现先赋值再比较，条件恒为 true —— 设置流每次重发都会把用户拖好的曲线清空。
         if (idx != this.presetIndex) {

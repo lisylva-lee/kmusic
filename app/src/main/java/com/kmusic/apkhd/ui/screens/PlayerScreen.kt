@@ -44,6 +44,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.kmusic.apkhd.ui.theme.LocalMoyinColors
+import com.kmusic.apkhd.ui.theme.LocalPlayerAccent
+import com.kmusic.apkhd.ui.theme.rememberCoverTint
+import com.kmusic.apkhd.ui.theme.withPlayerAccent
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -66,7 +70,17 @@ import com.kmusic.apkhd.ui.components.CoverArt
 import com.kmusic.apkhd.ui.components.VinylCover
 import com.kmusic.apkhd.audio.SpectrumProbe
 import com.kmusic.apkhd.ui.AudioInfo
-import com.kmusic.apkhd.ui.components.EqBandSliders
+import com.kmusic.apkhd.playback.FxStatus
+import com.kmusic.apkhd.ui.theme.MoyinShape
+import com.kmusic.apkhd.ui.components.EqCurve
+import com.kmusic.apkhd.ui.components.EqPresetGroupedChips
+import com.kmusic.apkhd.ui.components.NumberInputDialog
+import com.kmusic.apkhd.ui.components.PlayerImmersiveMode
+import com.kmusic.apkhd.ui.components.SaveCurveDialog
+import com.kmusic.apkhd.ui.components.UserCurveList
+import com.kmusic.apkhd.ui.components.playerSwipeGestures
+import com.kmusic.apkhd.ui.components.restoreBarsOnTouch
+import com.kmusic.apkhd.ui.components.suggestedCurveName
 import com.kmusic.apkhd.ui.components.SectionHeader
 import com.kmusic.apkhd.ui.components.MoyinIcon
 import com.kmusic.apkhd.ui.icons.IconBack
@@ -177,6 +191,11 @@ fun PlayerScreen(
     onEqPresetChange: (Int) -> Unit = {},
     onRefreshEq: () -> Unit = {},
     onEqBandChange: (Int, Int) -> Unit = { _, _ -> },
+    /** 用户自建曲线（A3），上限 20 条 */
+    userEqPresets: List<com.kmusic.apkhd.playback.UserEqPresets.Preset> = emptyList(),
+    onSaveEqCurve: (String) -> Unit = {},
+    onApplyEqCurve: (com.kmusic.apkhd.playback.UserEqPresets.Preset) -> Unit = {},
+    onDeleteEqCurve: (String) -> Unit = {},
     fxBass: Int = 0,
     onFxBassChange: (Int) -> Unit = {},
     fxLoudness: Int = 0,
@@ -233,9 +252,13 @@ fun PlayerScreen(
     onCreatePlaylistWithTrack: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    val c = moyinColors()
+    val themeColors = moyinColors()
     // 封面解码要按目标尺寸限制，Builder 需要 Context
     val context = LocalContext.current
+    // ── B1 · 封面取色 ──
+    // 只在深色生效（浅色是纸感设计，一层封面色会把纸面弄脏，见 CoverTint 注释）。
+    // 取不到合格颜色时返回 null，一律回退主题 accent —— 不做「凑一个色」。
+    val coverTint = rememberCoverTint(track?.coverUrl)
     var showLyrics by remember { mutableStateOf(false) }
     var showQueue by remember { mutableStateOf(false) }
     var showMode by remember { mutableStateOf(false) }
@@ -257,10 +280,34 @@ fun PlayerScreen(
     // 修法：**根 Box 自己接 clickable**（不是加一个兄弟层 —— 兄弟层在最底层会被上层的
     // Column 盖住，命中测试走不到它）。根节点自己的 pointerInput 在冒泡链的末端，
     // 子元素（黑胶/按钮/进度条）先拿到事件，没人消费的才落到这里被吞掉。
+    // ── B1 · 播放页强调色 ──
+    // 取到封面主色就整页换过去（进度条/主键/选中态/音效面板一起变），
+    // 取不到就原样使用主题 accent。浅色主题下 coverTint 恒为 null。
+    CompositionLocalProvider(
+        LocalMoyinColors provides themeColors.withPlayerAccent(coverTint),
+        LocalPlayerAccent provides coverTint
+    ) {
+    // 阴影掉外层的 c：下面几十处 c.accent / c.accentFill 必须读到替换后的调色板，
+    // 否则会出现「进度条变了、按钮还是旧的」的半改状态。
+    val c = moyinColors()
+
+    // ── B3 · 沉浸模式 ──
+    // 只有「播放页开着、且没有任何面板弹在上面」时才隐藏系统栏：
+    // 面板里要拖动、要读数值，状态栏消失会让面板顶到刘海/摄像头下面。
+    var touchTick by remember { mutableIntStateOf(0) }
+    // ⚠️ showLyrics 不算「面板」：它是封面/歌词互换，不是盖在上面的浮层，
+    // 算进去会导致「切到歌词就再也不进沉浸」，而那正是最需要沉浸的界面。
+    val anySheetOpen = showQueue || showMode || showQuality ||
+        showEffects || showInfo || showMore || showPlaylistPicker || showNewPlaylist
+    PlayerImmersiveMode(
+        enabled = !anySheetOpen,
+        interactionTick = touchTick
+    )
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(c.bg)
+            .restoreBarsOnTouch { touchTick++ }
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -374,6 +421,14 @@ fun PlayerScreen(
                         Box(
                             Modifier
                                 .size(coverSide)
+                                // B2（宽屏）：封面/歌词在宽屏是并排的，没有「横滑切过去」这个对象，
+                                // 所以只保留**下滑收起**；横滑留给窄屏那套（封面 ⇄ 歌词互换）。
+                                // 手势挂在封面盒上而不是整页：右侧歌词要上下滚，挂整页必抢。
+                                .playerSwipeGestures(
+                                    onSwipeToLyrics = {},
+                                    onSwipeDown = { onBack() },
+                                    horizontalEnabled = false
+                                )
                                 .clickable(
                                     indication = null,
                                     interactionSource = remember { MutableInteractionSource() }
@@ -510,6 +565,13 @@ fun PlayerScreen(
                 Box(
                     Modifier
                         .size(coverSide)
+                        // B2 · 横滑切封面/歌词，下滑收起播放页。
+                        // 只挂在这个 Box（封面/歌词），**不挂整页** —— 整页有进度条横拖
+                        // 和歌词竖滚，整页挂手势就是主动制造误触。
+                        .playerSwipeGestures(
+                            onSwipeToLyrics = { toLyrics -> showLyrics = toLyrics },
+                            onSwipeDown = { onBack() }
+                        )
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -704,6 +766,10 @@ fun PlayerScreen(
                 onEqEnabledChange = onEqEnabledChange,
                 onEqPresetChange = onEqPresetChange,
                 onEqBandChange = onEqBandChange,
+                userEqPresets = userEqPresets,
+                onSaveEqCurve = onSaveEqCurve,
+                onApplyEqCurve = onApplyEqCurve,
+                onDeleteEqCurve = onDeleteEqCurve,
                 onRefreshEq = onRefreshEq,
                 fxBass = fxBass, onFxBassChange = onFxBassChange,
                 fxLoudness = fxLoudness, onFxLoudnessChange = onFxLoudnessChange,
@@ -716,6 +782,7 @@ fun PlayerScreen(
                 fxHeldCount = fxHeldCount,
                 fxWantedCount = fxWantedCount,
                 onReattachFx = onReattachFx,
+                paused = !isPlaying,
                 audioOffload = audioOffload,
                 dsdPlaying = dsdPlaying,
                 dsdLabel = dsdLabel,
@@ -761,6 +828,7 @@ fun PlayerScreen(
                 onDismiss = { showQueue = false }
             )
         }
+    }
     }
 }
 
@@ -1069,6 +1137,17 @@ private fun LyricsPane(
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier.fillMaxWidth()
                             )
+                            // B1 · 当前行强调色下划线：强调色跟着封面走
+                            if (on) {
+                                Spacer(Modifier.height(4.wdp))
+                                Box(
+                                    Modifier
+                                        .width(18.wdp)
+                                        .height(2.wdp)
+                                        .clip(RoundedCornerShape(2.dp))
+                                        .background(c.accentLine)
+                                )
+                            }
 
                         // 译文：每行只要有就显示，字号比原文小一档、颜色降一档
                         val tr = translations[i]
@@ -1369,6 +1448,11 @@ private fun EffectSheet(
     onEqEnabledChange: (Boolean) -> Unit,
     onEqPresetChange: (Int) -> Unit,
     onEqBandChange: (Int, Int) -> Unit,
+    /** 用户自建曲线（A3） */
+    userEqPresets: List<com.kmusic.apkhd.playback.UserEqPresets.Preset> = emptyList(),
+    onSaveEqCurve: (String) -> Unit = {},
+    onApplyEqCurve: (com.kmusic.apkhd.playback.UserEqPresets.Preset) -> Unit = {},
+    onDeleteEqCurve: (String) -> Unit = {},
     onRefreshEq: () -> Unit,
     fxBass: Int, onFxBassChange: (Int) -> Unit,
     fxLoudness: Int, onFxLoudnessChange: (Int) -> Unit,
@@ -1382,6 +1466,8 @@ private fun EffectSheet(
     fxHeldCount: Int = 0,
     fxWantedCount: Int = 0,
     onReattachFx: () -> Unit,
+    /** 暂停/停止中：App 会把池位归还，状态说明要能区分于「全关」 */
+    paused: Boolean = false,
     audioOffload: Boolean,
     /** 正在播 DSD（音效面板据此提示「均衡器已自动旁路」） */
     dsdPlaying: Boolean = false,
@@ -1402,6 +1488,9 @@ private fun EffectSheet(
     // 5 段滑块默认收起：这些滑块常驻时，手指落在上面就等于改曲线（面板本身要上下滚）。
     // 注意只折滑块 —— 均衡器/预设/低音/响度这些行始终可见。
     var slidersOpen by remember { mutableStateOf(false) }
+    // A3：保存曲线的命名浮层 + 当前生效的用户曲线名（只用于列表高亮）
+    var savingCurve by remember { mutableStateOf(false) }
+    var activeCurveName by remember { mutableStateOf<String?>(null) }
     val noInd = { _: MutableInteractionSource -> }
 
     Box(
@@ -1465,6 +1554,71 @@ private fun EffectSheet(
             }
             Spacer(Modifier.height(6.wdp))
 
+            // ── A4 · 三态说明 ──
+            // 以前只有「当前占用：N 项」——回答的是池位，不是用户真正想知道的
+            // 「我听到的效果生效了吗，没生效是为什么」。判定逻辑在 FxStatus 里可单测。
+            run {
+                val wanted = (if (eqEnabled) 1 else 0) +
+                    (if (fxBass > 0) 1 else 0) +
+                    (if (fxLoudness > 0) 1 else 0)
+                // headroom / 实际响度就地算：这两个值只用于解释文案，
+                // 从 AudioEffectHolder 读是普通字段（非 Compose state），读了也不会重组，
+                // 反而会出现「文案跟曲线不同步」。
+                val peakDb = (eqBands.maxOrNull() ?: 0).coerceAtLeast(0) / 100f
+                val requestedDb = fxLoudness / 100f
+                val appliedDb = (requestedDb - peakDb).coerceIn(-12f, 12f)
+                val status = FxStatus.resolve(
+                    offload = audioOffload,
+                    dsdPlaying = dsdPlaying,
+                    dsdBypassEq = dsdBypassEq,
+                    wanted = wanted,
+                    held = fxHeldCount,
+                    starved = fxStarved,
+                    paused = paused,
+                    headroomDb = peakDb,
+                    loudnessAppliedDb = appliedDb,
+                    loudnessRequestedDb = requestedDb
+                )
+                val (line, tone) = when (status) {
+                    is FxStatus.Active -> {
+                        val sb = StringBuilder("音效生效中")
+                        // 响度开着：说清「设定 9 dB 实际只有 3 dB」—— 这正是 headroom 的代价
+                        if (status.loudnessRequestedDb > 0f &&
+                            status.loudnessAppliedDb + 0.1f < status.loudnessRequestedDb
+                        ) {
+                            sb.append(
+                                " · 响度实际 +${"%.1f".format(status.loudnessAppliedDb)} dB" +
+                                    "（设定 +${"%.0f".format(status.loudnessRequestedDb)} dB，" +
+                                    "其余让给 EQ 余量）"
+                            )
+                        } else if (status.headroomDb > 0.05f) {
+                            sb.append(" · 为 EQ 让出 ${"%.1f".format(status.headroomDb)} dB 余量")
+                        }
+                        sb.toString() to c.t2
+                    }
+                    is FxStatus.Bypassed -> when (status.reason) {
+                        FxStatus.Bypassed.Reason.OFFLOAD ->
+                            "已旁路：省电播放（音频直通 DSP）" to c.t3
+                        FxStatus.Bypassed.Reason.DSD ->
+                            "已旁路：DSD 解码中（设置已保留）" to c.t3
+                        FxStatus.Bypassed.Reason.ALL_OFF ->
+                            "三项全关，未占用系统音效" to c.t3
+                    }
+                    FxStatus.PoolStarved ->
+                        "资源占用：系统音效槽被其它 App 占满，暂停后会自动重试" to c.t3
+                    FxStatus.Suspended ->
+                        "已配置，暂停中已暂时归还音效槽（继续播放会重新挂上）" to c.t3
+                    FxStatus.Idle -> "全部关闭" to c.t3
+                }
+                Text(
+                    line,
+                    color = tone,
+                    fontSize = 12.wsp,
+                    lineHeight = 18.wsp,
+                    modifier = Modifier.padding(horizontal = 18.wdp, vertical = 4.wdp)
+                )
+            }
+
             if (audioOffload) {
                 // offload 时整条音效链都没挂上 —— 与其显示一堆点了没反应的开关，不如说清楚
                 Text(
@@ -1524,18 +1678,60 @@ private fun EffectSheet(
                         arrowExpanded = expanded == "eq"
                     ) { expanded = if (expanded == "eq") null else "eq" }
                     if (expanded == "eq") {
-                        ChipRow(
-                            options = eqPresets.mapIndexed { i, n -> i.toString() to n },
-                            selected = eqPreset.toString()
-                        ) {
-                            onEqPresetChange(it.toInt())
-                            expanded = null   // 选完就把 chip 行收起来，别一直占着
-                        }
+                        // 分组展示（风格 / 场景 / 设备）：下标仍是全局唯一，
+                        // 分组只影响排版 —— 见 EqPresets 的顺序锁死约束。
+                        EqPresetGroupedChips(
+                            selected = eqPreset,
+                            customActive = eqCustom,
+                            onPick = { idx ->
+                                onEqPresetChange(idx)
+                                expanded = null   // 选完就把 chip 行收起来，别一直占着
+                            }
+                        )
                     }
                 }
 
-                // 只有这排 5 段滑块是可折叠的：默认收起，展开后才出现，
-                // 展开后也只有手柄能拖（见 EqBandSliders 的防误触说明）。
+                // A3 · 用户曲线：只有「保存当前曲线」一个动作，不加开关。
+                // 用户曲线与内置预设并列显示，选中后 eqCustom=true。
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 18.wdp, vertical = 2.wdp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(99.dp))
+                            .background(if (c.isDark) Color(0x14FFFFFF) else Color(0x0A000000))
+                            .clickable(
+                                indication = null,
+                                interactionSource = remember { MutableInteractionSource() }
+                            ) { savingCurve = true }
+                            .padding(horizontal = 13.wdp, vertical = 7.wdp)
+                    ) {
+                        Text("保存当前曲线", color = c.t2, fontSize = 12.wsp)
+                    }
+                    if (userEqPresets.isNotEmpty()) {
+                        Spacer(Modifier.width(8.wdp))
+                        Text(
+                            "我的 ${userEqPresets.size} 条",
+                            color = c.t3,
+                            fontSize = 11.wsp
+                        )
+                    }
+                }
+                if (userEqPresets.isNotEmpty()) {
+                    UserCurveList(
+                        presets = userEqPresets,
+                        activeName = if (eqCustom) activeCurveName else null,
+                        onApply = { onApplyEqCurve(it) },
+                        onDelete = { name -> onDeleteEqCurve(name) }
+                    )
+                }
+
+                // 只有这里那块是可折叠的：默认收起，展开后才出现。
+                // v2.3.4 起 5 根竖条换成一条可拖曲线（EqCurve），形态只剩一种，
+                // 不再「曲线 + 滑块」并存 —— 同一件事两套交互只会更难懂。
                 EffectRow(
                     "频段调整",
                     if (slidersOpen) "收起" else "展开",
@@ -1548,11 +1744,18 @@ private fun EffectSheet(
                     }
                 ) { slidersOpen = !slidersOpen }
                 if (slidersOpen) {
-                    EqBandSliders(
+                    EqCurve(
                         bands = eqBands,
                         freqs = eqFreqs,
                         range = eqRange,
                         onBandChange = onEqBandChange
+                    )
+                    Text(
+                        "拖动圆点调该频段，双击复位 0 dB。空白处上下滑是滚面板。",
+                        color = c.t3,
+                        fontSize = 11.wsp,
+                        lineHeight = 15.wsp,
+                        modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
                     )
                 }
             }
@@ -1625,6 +1828,21 @@ private fun EffectSheet(
             if (expanded == "sleep") {
                 ChipRow(SLEEP_STEPS, sleepTotalMin.toString()) { onSleepChange(it.toInt()) }
             }
+        }
+        // A3：命名浮层单独一层，盖在抽屉上（抽屉是 verticalScroll，塞在里面的输入框
+        // 会被滚走，键盘弹出时也不好看）
+        if (savingCurve) {
+            SaveCurveDialog(
+                suggestion = suggestedCurveName(
+                    eqCustom,
+                    eqPresets.getOrNull(eqPreset) ?: eqPresets.firstOrNull()
+                ),
+                onDismiss = { savingCurve = false },
+                onConfirm = { name ->
+                    onSaveEqCurve(name)
+                    savingCurve = false
+                }
+            )
         }
     }
 }
@@ -1880,6 +2098,8 @@ private fun MoreSheet(
     onDismiss: () -> Unit
 ) {
     val c = moyinColors()
+    // B5：精确输入浮层（"offset" / "font"），null = 不显示
+    var numericEdit by remember { mutableStateOf<String?>(null) }
     Box(
         Modifier
             .fillMaxSize()
@@ -1938,9 +2158,11 @@ private fun MoreSheet(
                 valueActive = lyricOffsetMs != LYRIC_OFFSET_DEFAULT_MS,
                 minusLabel = "延后",
                 plusLabel = "提前",
+                hint = "整首歌的歌词整体前后移动；点数值可直接输入秒数",
                 onMinus = { onNudgeOffset(-500) },
                 onPlus = { onNudgeOffset(500) },
-                onReset = onResetOffset
+                onReset = onResetOffset,
+                onEdit = { numericEdit = "offset" }
             )
             MoreStepper(
                 label = "字号",
@@ -1948,9 +2170,11 @@ private fun MoreSheet(
                 valueActive = fontScale != 1f,
                 minusLabel = "小",
                 plusLabel = "大",
+                hint = "只影响歌词，不影响界面其它文字；点数值可直接输入百分比",
                 onMinus = { onNudgeFontScale(-0.1f) },
                 onPlus = { onNudgeFontScale(0.1f) },
-                onReset = onResetFontScale
+                onReset = onResetFontScale,
+                onEdit = { numericEdit = "font" }
             )
             if (aiConfigured) {
                 MoreRow(
@@ -1966,12 +2190,46 @@ private fun MoreSheet(
                 MoreRow(IconInfo, "歌词不对？") { onReportWrongLyric() }
             }
         }
+
+        // B5：精确输入浮层盖在「更多」面板之上
+        when (numericEdit) {
+            "offset" -> NumberInputDialog(
+                title = "歌词时间轴",
+                initial = "%.1f".format(lyricOffsetMs / 1000f),
+                suffix = "秒",
+                hint = "正数 = 歌词提前，负数 = 延后；直接输入想要的秒数",
+                onDismiss = { numericEdit = null },
+                onConfirm = { raw ->
+                    val ms = (raw.toDouble() * 1000).toLong()
+                        .coerceIn(-10_000L, 10_000L)
+                    onNudgeOffset(ms - lyricOffsetMs)
+                    numericEdit = null
+                },
+                onReset = { onResetOffset(); numericEdit = null }
+            )
+            "font" -> NumberInputDialog(
+                title = "歌词字号",
+                initial = "${(fontScale * 100).toInt()}",
+                suffix = "%",
+                hint = "范围 80% ~ 180%；100% 是标准大小",
+                onDismiss = { numericEdit = null },
+                onConfirm = { raw ->
+                    val pct = raw.toDouble().coerceIn(80.0, 180.0)
+                    onNudgeFontScale((pct / 100.0).toFloat() - fontScale)
+                    numericEdit = null
+                },
+                onReset = { onResetFontScale(); numericEdit = null }
+            )
+        }
     }
 }
 
 /**
- * 「更多」里的 ± 调节行：左标签、右数值（点数值 = 复位）、两端各一个 chip。
- * 和歌词区原来那排 chip 是同一套手感，只是换了个位置。
+ * 「更多」里的 ± 调节行：左标签、右数值、两端各一个 chip。
+ *
+ * 数值本身可点 → 打开精确输入（B5）。以前点它是直接复位：想改小一点点
+ * 只能连点，点歪一下还会被清回默认值。现在复位放进输入浮层里，
+ * 两个动作不再抢同一个热区。
  */
 @Composable
 private fun MoreStepper(
@@ -1982,9 +2240,14 @@ private fun MoreStepper(
     plusLabel: String,
     onMinus: () -> Unit,
     onPlus: () -> Unit,
-    onReset: () -> Unit
+    onReset: () -> Unit,
+    /** 打开精确输入；null 时数值不可点（保持老行为） */
+    onEdit: (() -> Unit)? = null,
+    /** 行下方的一句说明，解释这一行到底影响什么 */
+    hint: String? = null
 ) {
     val c = moyinColors()
+    Column(Modifier.fillMaxWidth()) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -1994,15 +2257,16 @@ private fun MoreStepper(
         Text(label, color = c.t1, fontSize = 14.wsp)
         Spacer(Modifier.weight(1f))
         MoreChip(minusLabel, onMinus)
-        // 数值本身可点：点一下复位。固定宽度，避免 "+0.5s" 和 "100%" 宽度不同把两边 chip 挤来挤去
+        // 数值固定宽度：避免 "+0.5s" 和 "100%" 宽度不同把两边 chip 挤来挤去。
+        // 现在点它是**精确输入**（复位在浮层里），不再是「点一下就清空」。
         Box(
             Modifier
                 .width(58.wdp)
-                .clip(RoundedCornerShape(99.wdp))
+                .clip(RoundedCornerShape(99.dp))
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() }
-                ) { onReset() }
+                ) { if (onEdit != null) onEdit() }
                 .padding(vertical = 6.wdp),
             contentAlignment = Alignment.Center
         ) {
@@ -2014,6 +2278,16 @@ private fun MoreStepper(
             )
         }
         MoreChip(plusLabel, onPlus)
+    }
+    if (hint != null) {
+        Text(
+            hint,
+            color = c.t3,
+            fontSize = 11.wsp,
+            lineHeight = 15.wsp,
+            modifier = Modifier.padding(start = 18.wdp, end = 18.wdp, bottom = 6.wdp)
+        )
+    }
     }
 }
 
@@ -2154,8 +2428,8 @@ private fun InfoSheet(
                     else Modifier.fillMaxWidth().heightIn(max = sheetMax.wdp)
                 )
                 .clip(
-                    if (drawer) RoundedCornerShape(topStart = 20.wdp, bottomStart = 20.wdp)
-                    else RoundedCornerShape(topStart = 20.wdp, topEnd = 20.wdp)
+                    if (drawer) MoyinShape.drawer
+                    else MoyinShape.sheetTop
                 )
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
                 .clickable(

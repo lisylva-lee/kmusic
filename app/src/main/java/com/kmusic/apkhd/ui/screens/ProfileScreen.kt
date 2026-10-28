@@ -23,6 +23,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kmusic.apkhd.ui.components.EqBandSliders
+import com.kmusic.apkhd.ui.components.EqCurve
+import com.kmusic.apkhd.ui.components.EqPresetGroupedChips
+import com.kmusic.apkhd.ui.components.SaveCurveDialog
+import com.kmusic.apkhd.ui.components.UserCurveList
+import com.kmusic.apkhd.ui.components.suggestedCurveName
 import com.kmusic.apkhd.ui.components.MoyinIcon
 import com.kmusic.apkhd.ui.components.MoyinTitle
 import com.kmusic.apkhd.ui.components.MoyinSwitch
@@ -145,6 +150,11 @@ fun ProfileScreen(
     eqCustom: Boolean = false,
     onEqPresetChange: (Int) -> Unit = {},
     onEqBandChange: (Int, Int) -> Unit = { _, _ -> },
+    /** 用户自建曲线（A3） */
+    userEqPresets: List<com.kmusic.apkhd.playback.UserEqPresets.Preset> = emptyList(),
+    onSaveEqCurve: (String) -> Unit = {},
+    onApplyEqCurve: (com.kmusic.apkhd.playback.UserEqPresets.Preset) -> Unit = {},
+    onDeleteEqCurve: (String) -> Unit = {},
     // 增强音效（低音/响度）。0 为关闭
     //
     // v2.3.2：环绕、混响、动态范围已删除 —— 三项（均衡器/低音/响度）合并进
@@ -192,6 +202,9 @@ fun ProfileScreen(
     var eqExpanded by remember { mutableStateOf(false) }
     // 均衡器详情区（预设 + 频段滑块）默认收起 —— 设置页以前滑块常驻，太长
     var eqDetailOpen by remember { mutableStateOf(false) }
+    // A3：保存曲线浮层 + 当前生效的用户曲线名
+    var savingCurve by remember { mutableStateOf(false) }
+    var activeCurveName by remember { mutableStateOf<String?>(null) }
     // "endpoint" / "key" / "model" —— 非空时弹出输入框
     var aiEditing by remember { mutableStateOf<String?>(null) }
     var fxBassExpanded by remember { mutableStateOf(false) }
@@ -730,15 +743,15 @@ fun ProfileScreen(
             SettingSwitchRow(
                 title = "均衡器",
                 subtitle = when {
-                    !eqEnabled -> "关闭"
+                    !eqEnabled -> "关闭 · 打开后按预设调整频响，占 1 个系统音效位"
                     eqPresets.isEmpty() -> "已开启 —— 预设列表会在开始播放后出现"
-                    else -> "已开启，正在按预设调整频响"
+                    else -> "已开启 · 正在按「${eqPresets.getOrNull(eqPreset) ?: "原声"}」调整频响"
                 },
                 checked = eqEnabled,
                 onCheckedChange = onEqEnabledChange
             )
         }
-        // 预设行常显；只把 5 段滑块折起来 —— 滑块常驻时手指落在上面等于改曲线。
+        // 预设行常显；只把频段区折起来 —— 滑块/曲线常驻时手指落在上面等于改曲线。
         if (eqPresets.isNotEmpty()) {
             item {
                 SettingRow(
@@ -753,15 +766,16 @@ fun ProfileScreen(
             }
             if (eqExpanded) {
                 item {
-                    InlineOptions(
-                        options = eqPresets.mapIndexed { i, n -> i.toString() to n },
-                        selected = eqPreset.toString(),
-                        onPick = { onEqPresetChange(it.toInt()); eqExpanded = false }
+                    // A3：按 风格 / 场景 / 设备 分组，下标仍全局唯一
+                    EqPresetGroupedChips(
+                        selected = eqPreset,
+                        customActive = eqCustom,
+                        onPick = { onEqPresetChange(it); eqExpanded = false }
                     )
                 }
             }
         }
-        // 频段滑块：设备给几段画几段。默认收起，展开后也只有手柄能拖。
+        // 频段曲线：设备给几段画几段。默认收起，展开后只有圆点能拖。
         if (eqBands.isNotEmpty()) {
             item {
                 SettingRow(
@@ -776,7 +790,7 @@ fun ProfileScreen(
             }
             if (eqDetailOpen) {
                 item {
-                    EqBandSliders(
+                    EqCurve(
                         bands = eqBands,
                         freqs = eqFreqs,
                         range = eqRange,
@@ -785,11 +799,30 @@ fun ProfileScreen(
                 }
                 item {
                     Text(
-                        text = "拖动滑块调整各频段增益；改动后不再跟随预设。双击手柄可复位到 0 dB",
+                        text = "拖动圆点调整该频段；双击圆点复位 0 dB。改动后不再跟随预设。",
                         color = moyinColors().t3,
                         fontSize = 11.wsp,
                         modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
                     )
+                }
+                // A3：保存当前曲线 —— 只有一个动作，不加开关
+                item {
+                    SettingRow(
+                        title = "保存当前曲线",
+                        subtitle = "只存这 ${eqBands.size} 段增益，不含低音/响度；同名覆盖",
+                        value = if (userEqPresets.isEmpty()) null else "已有 ${userEqPresets.size} 条",
+                        onClick = { savingCurve = true }
+                    )
+                }
+                if (userEqPresets.isNotEmpty()) {
+                    item {
+                        UserCurveList(
+                            presets = userEqPresets,
+                            activeName = if (eqCustom) activeCurveName else null,
+                            onApply = { onApplyEqCurve(it) },
+                            onDelete = { name -> onDeleteEqCurve(name) }
+                        )
+                    }
                 }
             }
         }
@@ -816,8 +849,12 @@ fun ProfileScreen(
             item {
                 SettingRow(
                     title = "低音增强",
-                    subtitle = if (fxBassStarved) "资源占用，可重挂"
-                    else if (fxBassAvailable) strengthLabel(fxBass) else "本机不支持",
+                    subtitle = when {
+                        fxBassStarved -> "资源占用，可重挂"
+                        !fxBassAvailable -> "本机不支持"
+                        fxBass <= 0 -> "关 · 抬 60/230Hz 的低频，中频不动"
+                        else -> strengthLabel(fxBass) + " · 抬 60/230Hz 的低频，中频不动"
+                    },
                     onClick = { if (fxBassAvailable && !fxBassStarved) fxBassExpanded = !fxBassExpanded }
                 )
             }
@@ -834,9 +871,12 @@ fun ProfileScreen(
             item {
                 SettingRow(
                     title = "响度增强",
-                    subtitle = if (fxLoudnessStarved) "资源占用，可重挂"
-                    else if (!fxLoudnessAvailable) "本机不支持"
-                    else if (fxLoudness <= 0) "关闭" else "+${fxLoudness / 100} dB",
+                    subtitle = when {
+                        fxLoudnessStarved -> "资源占用，可重挂"
+                        !fxLoudnessAvailable -> "本机不支持"
+                        fxLoudness <= 0 -> "关 · 抬整体音量，EQ 正增益会先扣掉同等余量"
+                        else -> "+${fxLoudness / 100} dB · EQ 正增益会先扣掉同等余量"
+                    },
                     onClick = { if (fxLoudnessAvailable && !fxLoudnessStarved) fxLoudExpanded = !fxLoudExpanded }
                 )
             }
@@ -940,6 +980,21 @@ fun ProfileScreen(
                 onCheckedChange = onWifiOnlyDownloadChange
             )
         }
+    }
+
+    // A3：保存曲线的命名浮层（放在 LazyColumn 外面，避免被列表裁掉）
+    if (savingCurve) {
+        SaveCurveDialog(
+            suggestion = suggestedCurveName(
+                eqCustom,
+                eqPresets.getOrNull(eqPreset) ?: eqPresets.firstOrNull()
+            ),
+            onDismiss = { savingCurve = false },
+            onConfirm = { name ->
+                onSaveEqCurve(name)
+                savingCurve = false
+            }
+        )
     }
 }
 

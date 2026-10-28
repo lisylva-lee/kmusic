@@ -92,6 +92,8 @@ import com.kmusic.apkhd.data.UserPlaylistStore
 import com.kmusic.apkhd.data.PlaylistFavStore
 import com.kmusic.apkhd.model.UserPlaylist
 import com.kmusic.apkhd.playback.AudioEffectHolder
+import com.kmusic.apkhd.playback.EqPresets
+import com.kmusic.apkhd.playback.UserEqPresets
 import com.kmusic.apkhd.playback.DsdPlaybackState
 import com.kmusic.apkhd.model.SearchTab
 import com.kmusic.apkhd.model.AlbumBrief
@@ -3522,6 +3524,50 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         eqBands = AudioEffectHolder.bandLevels().toList()
     }
 
+    // ---------------- 用户自定义曲线（A3） ----------------
+
+    /** 用户存的曲线（上限 20 条，存在 SharedPreferences，不占系统音效池位） */
+    var userEqPresets by mutableStateOf<List<UserEqPresets.Preset>>(emptyList())
+        private set
+
+    private fun reloadUserPresets() {
+        userEqPresets = UserEqPresets.load(getApplication())
+    }
+
+    /**
+     * 把当前 5 段曲线存成一条命名预设。
+     *
+     * 只存曲线本身，不带低音/响度 —— 用户点的是「保存这条曲线」，
+     * 顺手把别的音效一起存进去会让这个动作的语义变得说不清。
+     */
+    fun saveCurrentEqCurve(name: String) {
+        val gains = AudioEffectHolder.bandLevels().toList()
+        if (gains.isEmpty()) return
+        UserEqPresets.savePreset(getApplication(), name, gains)
+        reloadUserPresets()
+        DiagLog.log("EQ", "保存曲线「$name」= ${gains.joinToString(",")}")
+    }
+
+    fun deleteEqCurve(name: String) {
+        UserEqPresets.delete(getApplication(), name)
+        reloadUserPresets()
+    }
+
+    /** 套用一条用户曲线：走 applyCurve，命中内置曲线时界面会自动显示内置名 */
+    fun applyEqCurve(preset: UserEqPresets.Preset) {
+        val gains = preset.gains.toIntArray()
+        AudioEffectHolder.applyCurve(gains)
+        AudioEffectHolder.onUserEdited()
+        eqEnabled = true
+        eqCustom = true
+        eqBands = AudioEffectHolder.bandLevels().toList()
+        refreshEqPresets()
+        // 记住「现在用的是自定义」—— 否则重进页面顶部又显示成某个内置预设名
+        viewModelScope.launch {
+            settings.setEqEnabled(true)
+        }
+    }
+
     // ---------------- 睡眠定时 ----------------
 
     private var sleepJob: kotlinx.coroutines.Job? = null
@@ -4505,6 +4551,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         // 均衡器偏好
+        reloadUserPresets()
         viewModelScope.launch { settings.aiEndpoint.collect { aiEndpoint = it } }
         viewModelScope.launch { settings.aiApiKey.collect { aiApiKey = it } }
         viewModelScope.launch { settings.aiModel.collect { aiModel = it } }
