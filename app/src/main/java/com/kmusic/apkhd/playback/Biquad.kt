@@ -30,6 +30,67 @@ object Biquad {
     val IDENTITY = floatArrayOf(1f, 0f, 0f, 0f, 0f)
 
     /**
+     * 单步递推（转置直接 II 型），**系数下标与差分方程的对应关系只在这里写一次**。
+     *
+     * ```
+     * y  = b0*x + z1
+     * z1 = b1*x - a1*y + z2
+     * z2 = b2*x - a2*y
+     * ```
+     *
+     * 抽成函数是因为这里犯过一次极其隐蔽的错：把 `z1` 写成 `-b2*y`、`z2` 写成 `+a1*x`，
+     * 也就是 b2 和 a1 互换。这个错误的可怕之处在于它**不会报错、不会发散**——
+     * 1kHz 的 peaking 在 1kHz 处增益变成 0dB，却在 10kHz 涨到 +8dB、
+     * 16kHz 涨到 +320dB，最后全靠限幅器压回满幅，听感是「一片杂音」。
+     * 单测里必须拿**频率响应**验，不能只验系数是否算对。
+     *
+     * @param state 长度 2 的状态，原地更新
+     */
+    fun step(c: FloatArray, state: FloatArray, x: Float): Float {
+        val y = c[0] * x + state[0]
+        state[0] = c[1] * x - c[3] * y + state[1]
+        state[1] = c[2] * x - c[4] * y
+        return y
+    }
+
+    /**
+     * 跑一段正弦、丢掉前 [settle] 个样本，返回稳态增益（dB）。
+     *
+     * 用 **RMS** 而不是峰值：8kHz/48kHz 每周期只有 6 个样本，离散取样抓不到真正
+     * 的波峰，测出来会莫名低 1dB —— 那是测量误差，会被误当成滤波写错。
+     * RMS 对相位不敏感，且正弦的 A/√2 正好约掉。
+     *
+     * 用它做「系数 → 实际听感」的端到端验收：递推写错时 [magnitudeAt]（解析式）
+     * 依然是对的，只有真跑一遍才会暴露。这个函数就是为那次 b2/a1 互换的 bug 留的探针。
+     */
+    fun measureAmplitudeDb(
+        c: FloatArray,
+        freq: Float,
+        fs: Float = 48_000f,
+        amplitude: Float = 0.5f,
+        samples: Int = 48_000,
+        settle: Int = 12_000
+    ): Float {
+        val state = FloatArray(2)
+        val w = 2.0 * PI * (freq / fs)
+        var sum = 0.0
+        var count = 0
+        for (n in 0 until samples) {
+            val x = (amplitude * sin(w * n)).toFloat()
+            val y = step(c, state, x)
+            if (!y.isFinite()) return Float.POSITIVE_INFINITY
+            if (n >= settle) {
+                sum += y.toDouble() * y
+                count++
+            }
+        }
+        if (count == 0) return 0f
+        val rms = kotlin.math.sqrt(sum / count).toFloat()
+        val inRms = amplitude / kotlin.math.sqrt(2f)
+        return 20f * log10((rms / inRms).coerceAtLeast(1e-9f))
+    }
+
+    /**
      * 峰值滤波器（peaking EQ）。
      *
      * @param f0 中心频率 Hz

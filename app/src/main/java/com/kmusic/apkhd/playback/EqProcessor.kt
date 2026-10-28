@@ -58,8 +58,15 @@ class EqProcessor : BaseAudioProcessor() {
         /** 低音满档的搁架增益（dB） */
         const val BASS_MAX_DB = 9f
 
-        /** 软限幅的起始电平（线性），超过它才按 tanh 压 */
-        private const val SOFT_KNEE = 0.72f
+        /**
+         * 软限幅的起始电平（线性）。
+         *
+         * 取 0.90 而不是更低的 0.72：软拐点以下必须**完全线性**，否则正常的
+         * 大音量素材（成品母带峰值普遍 0.9~0.99）会有一大片样本被无谓地压扁。
+         * 实测 0.72 时「EQ 低音预设 + 低音极强 + 响度 +9」有 25~56% 的样本进压缩区，
+         * 听感是闷且有毛刺 —— 那不是失真该有的位置，是拐点定得太低。
+         */
+        private const val SOFT_KNEE = 0.90f
 
         /** 增益上下限（mB），与旧设备均衡器一致 */
         const val LEVEL_MIN = -1_500
@@ -86,6 +93,9 @@ class EqProcessor : BaseAudioProcessor() {
     @Volatile
     private var paramVersion: Int = 0
 
+    /** 上一次「输出接近满幅」告警的时刻（毫秒），3 秒限流 */
+    private var lastClipWarnMs: Long = 0
+
     private var appliedVersion: Int = -1
 
     // ── 运行态 ──
@@ -97,16 +107,16 @@ class EqProcessor : BaseAudioProcessor() {
 
     private var encoding: Int = C.ENCODING_INVALID
 
-    /** [band][channel] 状态（转置直接 II 型：z1、z2） */
-    private var z1 = Array(EqBands.COUNT) { FloatArray(0) }
-    private var z2 = Array(EqBands.COUNT) { FloatArray(0) }
+    /** [band][channel] → FloatArray(2) 状态（转置直接 II 型）—— 交给 [Biquad.step] 原地更新 */
+    private var zState = Array(EqBands.COUNT) { arrayOf(FloatArray(2)) }
 
     /** 每段系数，整体替换（不原地改，避免音频线程读到半套系数） */
     private var coeffs = Array(EqBands.COUNT) { Biquad.IDENTITY }
 
     private var shelf = Biquad.IDENTITY
-    private var shelfZ1 = FloatArray(0)
-    private var shelfZ2 = FloatArray(0)
+
+    /** 低音搁架：[channel] → FloatArray(2) 状态 */
+    private var shelfState = arrayOf(FloatArray(2))
 
     // ── 对外只读状态（界面用它解释「为什么没变化」） ──
 
@@ -223,10 +233,8 @@ class EqProcessor : BaseAudioProcessor() {
         sampleRate = inputAudioFormat.sampleRate
         channelCount = inputAudioFormat.channelCount
         encoding = inputAudioFormat.encoding
-        z1 = Array(EqBands.COUNT) { FloatArray(channelCount) }
-        z2 = Array(EqBands.COUNT) { FloatArray(channelCount) }
-        shelfZ1 = FloatArray(channelCount)
-        shelfZ2 = FloatArray(channelCount)
+        zState = Array(EqBands.COUNT) { Array(channelCount) { FloatArray(2) } }
+        shelfState = Array(channelCount) { FloatArray(2) }
         appliedVersion = -1
         DiagLog.log(
             "EQ",
@@ -289,29 +297,50 @@ class EqProcessor : BaseAudioProcessor() {
         val sh = shelf
 
         var base = start
+        var inPeak = 0f
+        var outPeak = 0f
+        var clipped = 0
         for (f in 0 until frames) {
             for (c in 0 until ch) {
                 var x = readSample(inputBuffer, base + c * bps)
+                val ax = abs(x)
+                if (ax > inPeak) inPeak = ax
                 var b = 0
                 while (b < bands) {
-                    val k = cf[b]
-                    val y = k[0] * x + z1[b][c]
-                    z1[b][c] = k[1] * x - k[2] * y + z2[b][c]
-                    z2[b][c] = k[3] * x - k[4] * y
-                    x = y
+                    x = Biquad.step(cf[b], zState[b][c], x)
                     b++
                 }
                 if (bassOn) {
-                    val y = sh[0] * x + shelfZ1[c]
-                    shelfZ1[c] = sh[1] * x - sh[2] * y + shelfZ2[c]
-                    shelfZ2[c] = sh[3] * x - sh[4] * y
-                    x = y
+                    x = Biquad.step(sh, shelfState[c], x)
                 }
                 x *= gain
-                if (x > SOFT_KNEE || x < -SOFT_KNEE) x = softClip(x)
+                if (x > SOFT_KNEE || x < -SOFT_KNEE) {
+                    x = softClip(x)
+                    clipped++
+                }
+                val ay = abs(x)
+                if (ay > outPeak) outPeak = ay
                 writeSample(out, x)
             }
             base += frameSize
+        }
+        // 低频端自检：正常音乐每块（约 4~20ms）的峰值不该长期贴着 1.0。
+        // 曾经因 b2/a1 用反而在高频端放大到 +320dB，全靠限幅器压回满幅 ——
+        // 听感是「一片杂音」，但界面一切正常、没有任何报错。这条日志就是那种
+        // 「界面上看不出、耳朵一听就废」的故障的抓手：outPeak 长期 > 0.99 且
+        // clipped 占样本数很大比例，就说明链上有东西在疯狂放大。
+        val total = frames * ch
+        if (total > 0 && (outPeak > 0.995f || clipped > total / 4)) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastClipWarnMs > 3_000) {
+                lastClipWarnMs = now
+                DiagLog.log(
+                    "EQ",
+                    "输出接近满幅：in=${"%.3f".format(inPeak)} out=${"%.3f".format(outPeak)} " +
+                        "限幅=${clipped * 100 / total}% 前级=${"%.1f".format(preGainDb)}dB " +
+                        "曲线=${gainsMb.joinToString(",")}"
+                )
+            }
         }
         // 不足一帧的尾巴原样带过去（正常不会发生，防御性）
         val tail = size - frames * frameSize
@@ -325,10 +354,8 @@ class EqProcessor : BaseAudioProcessor() {
     // ── 内部 ──
 
     private fun clearState() {
-        z1.forEach { it.fill(0f) }
-        z2.forEach { it.fill(0f) }
-        shelfZ1.fill(0f)
-        shelfZ2.fill(0f)
+        zState.forEach { perCh -> perCh.forEach { it.fill(0f) } }
+        shelfState.forEach { it.fill(0f) }
     }
 
     private fun refreshCoefficientsIfNeeded() {
@@ -346,14 +373,22 @@ class EqProcessor : BaseAudioProcessor() {
     }
 
     /**
-     * 软限幅：超过 [SOFT_KNEE] 的部分按 tanh 压，不会像硬削波那样炸出刺耳高次谐波。
-     * 只在真要溢出时才走这条路 —— 正常音量下就是无损直通。
+     * 软限幅：|x| 超过 [SOFT_KNEE] 后按 tanh 平滑压向 ±1。
+     *
+     * 公式必须是 `knee + (1-knee)·tanh((|x|-knee)/(1-knee))` ——
+     * 这样在拐点上**值连续且导数连续**（导数正好是 1）。曾经写成
+     * `0.7·tanh(...)·(1-knee) + knee`，在拐点处导数从 1 陡降到 0.07，
+     * 相当于给波形打了个折角，听感是毛刺 —— 数值上「不削顶」，实际照样失真。
      */
     private fun softClip(x: Float): Float {
-        val drive = (abs(x) - SOFT_KNEE) / (1f - SOFT_KNEE)
-        val shaped = 0.7f * tanhApprox(drive) * (1f - SOFT_KNEE) + SOFT_KNEE * sign(x)
+        val a = abs(x)
+        val over = (a - SOFT_KNEE) / (1f - SOFT_KNEE)
+        // tanhApprox 在 x>3 之后会越过 1 继续增长（有理近似只在 |x|<3 内准），
+        // 必须夹到 1 —— 否则「限幅器」自己变成放大器，和这次的 bug 同一个形状。
+        val shaped = SOFT_KNEE + (1f - SOFT_KNEE) * tanhApprox(over).coerceIn(0f, 1f)
+        val out = shaped * sign(x)
         // 极小概率出现 Inf/NaN 时退回硬限幅：绝不让一个坏样本污染整个缓冲
-        return if (shaped.isFinite()) shaped.coerceIn(-1f, 1f) else sign(x)
+        return if (out.isFinite()) out.coerceIn(-1f, 1f) else sign(x)
     }
 
     /** tanh 的有理近似（|x|<3 时误差 <1e-3），比 Math.tanh 快一个数量级 */

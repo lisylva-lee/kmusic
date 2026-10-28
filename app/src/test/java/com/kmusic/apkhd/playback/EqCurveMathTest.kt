@@ -512,4 +512,80 @@ class EqCurveMathTest {
         val peak = Biquad.peakBoostDb(gains, 0, 48_000f, 110f, 12f, 1.4f)
         assertEquals("全衰减时应夹到 0", 0f, peak, 0.01f)
     }
+
+    // ── 递推正确性（v2.3.5 真机「一片杂音」事故的回归锚） ──
+
+    /**
+     * 单段 peaking 的实际频率响应必须与 [Biquad.magnitudeAt] 的解析值一致。
+     *
+     * 这条用例是补的——之前只验「系数算得对」，没验「系数有没有按对的位置用」。
+     * 那时 `z1` 写成了 `-b2*y`、`z2` 写成 `+a1*x`（b2 与 a1 互换），
+     * 解析式照样对，实际递推却是：1kHz 处 0dB、10kHz +8dB、16kHz +320dB，
+     * 末段全靠限幅器压回满幅 → 听感一片杂音。**只有真跑递推才能抓住。**
+     */
+    @Test
+    fun `peaking 的递推响应与解析响应一致`() {
+        val fs = 48_000f
+        val c = Biquad.peaking(1_000f, 6f, 1.4142135f, fs)
+        for (f in listOf(100f, 500f, 1_000f, 2_000f, 8_000f, 15_000f)) {
+            val analytic = 20f * kotlin.math.log10(Biquad.magnitudeAt(c, f, fs))
+            val measured = Biquad.measureAmplitudeDb(c, f, fs)
+            assertEquals(
+                "1kHz peaking +6dB 在 $f Hz 处：解析 ${"%.2f".format(analytic)} dB，" +
+                    "实跑 ${"%.2f".format(measured)} dB",
+                analytic, measured, 0.5f
+            )
+        }
+        // 中心频率确实被抬了 6dB（不是 0）—— 这正是 b2/a1 互换时丢掉的那个效果
+        assertEquals("中心频率应抬 6dB", 6f, Biquad.measureAmplitudeDb(c, 1_000f, fs), 0.5f)
+    }
+
+    /**
+     * 十段串起来后，高频端不能失控。
+     *
+     * 事故现场：低音预设（600…-200 mB）在 8k 是 +44dB、16k 是 +320dB。
+     * 正常串接应始终在 ±20dB 内 —— 单段最大 ±15dB，十段首尾相接但带宽只有一个
+     * 倍频程，叠加不会到 20dB 以上。
+     */
+    @Test
+    fun `十段串接后任何频点都不超过 20dB`() {
+        val fs = 48_000f
+        val gains = intArrayOf(600, 593, 436, 282, 131, -7, -57, -108, -159, -200)
+        val coeffs = Array(EqBands.COUNT) { b ->
+            Biquad.peaking(EqBands.FREQS[b].toFloat(), gains[b] / 100f, 1.4142135f, fs)
+        }
+        for (f in listOf(31f, 62f, 125f, 250f, 500f, 1_000f, 2_000f, 4_000f, 8_000f, 16_000f)) {
+            var state = Array(EqBands.COUNT) { FloatArray(2) }
+            val w = 2.0 * kotlin.math.PI * (f / fs)
+            var peak = 1e-9f
+            for (n in 0 until 24_000) {
+                var x = (0.5f * kotlin.math.sin(w * n)).toFloat()
+                for (b in 0 until EqBands.COUNT) x = Biquad.step(coeffs[b], state[b], x)
+                if (!x.isFinite()) {
+                    throw AssertionError("$f Hz 在第 $n 个样本发散")
+                }
+                if (n >= 8_000 && kotlin.math.abs(x) > peak) peak = kotlin.math.abs(x)
+            }
+            val db = 20f * kotlin.math.log10(peak / 0.5f)
+            assertTrue("$f Hz 处增益 ${"%.1f".format(db)} dB 超出 ±20dB", db < 20f && db > -20f)
+        }
+    }
+
+    /**
+     * 低音搁架也不能把高频带起来。
+     *
+     * 低架的错误写法同样会把 b2/a1 用混，表现为「低音没抬、高频爆掉」——
+     * 而这正是用户听到的「杂音」。
+     */
+    @Test
+    fun `低音搁架只抬低频不动高频`() {
+        val fs = 48_000f
+        val c = Biquad.lowShelf(110f, 9f, 0.8f, fs)
+        val low = Biquad.measureAmplitudeDb(c, 40f, fs)
+        val mid = Biquad.measureAmplitudeDb(c, 1_000f, fs)
+        val high = Biquad.measureAmplitudeDb(c, 12_000f, fs)
+        assertTrue("40Hz 应抬到 8dB 以上，实际 ${"%.1f".format(low)}", low > 8f)
+        assertEquals("1kHz 应基本不动，实际 ${"%.1f".format(mid)}", 0f, mid, 1f)
+        assertEquals("12kHz 应基本不动，实际 ${"%.1f".format(high)}", 0f, high, 1f)
+    }
 }
