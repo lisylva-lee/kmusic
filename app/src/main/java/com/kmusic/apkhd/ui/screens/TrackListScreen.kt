@@ -60,6 +60,13 @@ fun TrackListScreen(
     onRemoveTrack: ((Track) -> Unit)? = null,
     onTrackClick: (Track, List<Track>) -> Unit,
     onBack: () -> Unit,
+    /**
+     * 源给的曲目数少于歌单声明数（例如声明 200 首只给 10 首）时填说明文案。
+     *
+     * 这个参数存在的唯一理由：以前这种情况完全静默 —— 列表页写「200 首」，
+     * 点进去 10 首，用户只会觉得 app 坏了。现在在列表底部说明原因。
+     */
+    footerNote: String? = null,
     modifier: Modifier = Modifier
 ) {
     val c = moyinColors()
@@ -244,6 +251,19 @@ fun TrackListScreen(
             } else {
                 LazyColumn {
                     items(tracks, key = { it.id }) { t -> rowFor(t) }
+                    footerNote?.let { note ->
+                        item(key = "__footer_note") {
+                            Text(
+                                text = note,
+                                color = c.t3,
+                                fontSize = 11.wsp,
+                                lineHeight = 16.wsp,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.wdp, vertical = 14.wdp)
+                            )
+                        }
+                    }
                 }
             }
         }

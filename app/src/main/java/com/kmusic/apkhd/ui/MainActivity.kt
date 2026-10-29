@@ -598,6 +598,11 @@ fun MoyinRoot() {
                             onBack = { vm.closePlaylist(); route = Route.None },
                             onDownload = vm::download,
                             downloadedIds = downloadedIds,
+                            footerNote = if (vm.playlistTruncated) {
+                                "这个歌单声明 ${(vm.playlistDetail ?: r.brief).trackCount} 首，" +
+                                    "但源只返回了 ${vm.playlistTracks.size} 首。\n" +
+                                    "换源重试或稍后再试；能播的仍会按顺序全部播放。"
+                            } else null,
                         )
                         is Route.Artist -> TrackListScreen(
                             title = r.brief.name,

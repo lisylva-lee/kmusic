@@ -11,17 +11,31 @@ import okhttp3.Request
 import java.util.concurrent.TimeUnit
 
 /**
- * 网易云客户端 —— **只取推荐位元数据，不做播放**。
+ * 网易云客户端。
  *
- * 播放侧的成本（登录 + 自有加密链路复刻）远大于收益，
- * 所以这里拿到的歌曲一律标 `source = "netease"`，
- * 播放时由 [TrackMatcher] 严格三重校验后回退到酷我。
+ * v2.3.7 起不再只是「取推荐位元数据」—— 因为 gdstudio 的 url/search/pic/lyric
+ * 四个接口已经 401（只有 playlist 可用），这几项改由本类直连 music.163.com。
+ *
+ * 直连的代价与边界，实测记在这里：
+ * - `song/enhance/player/url` 对 VIP/付费曲返回 `code=-110`（`fee=1`），拿不到链。
+ *   这是版权限制，不是 bug；这类歌要靠换源（酷我/咪咕），gdstudio 也帮不上。
+ * - 无需登录、无需 weapi 加密、无需 Referer。
+ * - `song/detail` 的 `ids` **必须是 JSON 数组**（`ids=[1,2,3]`）；
+ *   写成逗号分隔 `ids=1,2,3` 会返回 400。这个坑踩过。
  */
 class NeteaseClient {
 
     companion object {
         private const val TAG = "NeteaseClient"
         private const val BASE = "https://music.163.com/api"
+
+        /**
+         * `song/detail` 单次批量上限。
+         *
+         * 实测：传 100/200 个 id 都能回满；传 300/500 只回 **201** 条
+         * （服务端有硬上限，不是网络问题）。所以卡 200 最稳。
+         */
+        private const val SONG_DETAIL_BATCH = 200
     }
 
     private val client = OkHttpClient.Builder()
@@ -126,6 +140,106 @@ class NeteaseClient {
             https(NeteaseJson.instance.decodeFromString<NePlaylistDetailResponse>(body).result?.coverImgUrl)
         }.getOrNull()
     }
+
+    // ---------------- v2.3.7 直连补充能力 ----------------
+
+    /**
+     * 完整歌单：`v6/playlist/detail` 拿 trackIds → `song/detail` 分批补元数据。
+     *
+     * 为什么不能只读 `v6.playlist.tracks`：实测 1268 首的歌单，`tracks` 字段
+     * 只给 6 首（有的给 200），但 `trackIds` 是完整的。只读 tracks 就是
+     * 「歌单显示 1268 首、点进去只有 6 首」。
+     *
+     * [SONG_DETAIL_BATCH] 是实测上限：一次传 300/500 个 id 只回 201 条，
+     * 200 能稳定回满。
+     *
+     * @return 按歌单原顺序排列的曲目；取不到返回空列表（由上层决定怎么兜底）
+     */
+    suspend fun fullPlaylistTracks(pid: String): List<Track> = withContext(Dispatchers.IO) {
+        val body = get("$BASE/v6/playlist/detail?id=$pid&n=1000") ?: return@withContext emptyList()
+        val detail = runCatching {
+            NeteaseJson.instance.decodeFromString<NeV6PlaylistResponse>(body).playlist
+        }.onFailure { Log.w(TAG, "v6 playlist parse: ${it.message}") }.getOrNull()
+            ?: return@withContext emptyList()
+
+        val ids = detail.trackIds.orEmpty().map { it.id }.filter { it > 0 }
+        if (ids.isEmpty()) {
+            // 极少数歌单 v6 不给 trackIds（比如已下架），退回它自带的 tracks
+            return@withContext detail.tracks.orEmpty().map { it.toTrack() }
+        }
+
+        val out = ArrayList<Track>(ids.size)
+        for (chunk in ids.chunked(SONG_DETAIL_BATCH)) {
+            val arr = chunk.joinToString(",", prefix = "[", postfix = "]")
+            val sb = get("$BASE/song/detail?ids=$arr")
+            val songs = sb?.let {
+                runCatching { NeteaseJson.instance.decodeFromString<NeSongDetailResponse>(it).songs }
+                    .onFailure { e -> Log.w(TAG, "song/detail parse: ${e.message}") }
+                    .getOrNull()
+            }.orEmpty()
+            if (songs.isEmpty()) {
+                // 某一批失败就放弃整条链路 —— 半截歌单比空歌单更糟（顺序会错乱）
+                Log.w(TAG, "song/detail 批次失败，放弃直连（已取 ${out.size}/${ids.size}）")
+                return@withContext emptyList()
+            }
+            out += songs.map { it.toTrack() }
+        }
+        // song/detail 不保证回传顺序与请求一致，按 ids 重排
+        val byId = out.associateBy { it.sourceId }
+        ids.mapNotNull { byId[it.toString()] }
+    }
+
+    /**
+     * 播放直链。
+     *
+     * @return 可播 URL；无版权（404）/ 需 VIP（-110）时为 null，由上层换源。
+     */
+    suspend fun playUrl(songId: String, br: Int = 320_000): String? =
+        withContext(Dispatchers.IO) {
+            val body = get("$BASE/song/enhance/player/url?ids=[$songId]&br=$br")
+                ?: return@withContext null
+            runCatching {
+                NeteaseJson.instance.decodeFromString<NePlayUrlResponse>(body).data?.firstOrNull()
+            }.onFailure { Log.w(TAG, "playUrl parse: ${it.message}") }.getOrNull()
+                ?.url?.takeIf { it.isNotBlank() }
+        }
+
+    /** 歌词（LRC）。含翻译时优先返回原文，调用方需要翻译可另取 [lyricWithTranslation]。 */
+    suspend fun lyric(songId: String): String? = withContext(Dispatchers.IO) {
+        val body = get("$BASE/song/lyric?id=$songId&lv=-1&kv=-1&tv=-1")
+            ?: return@withContext null
+        runCatching {
+            NeteaseJson.instance.decodeFromString<NeLyricResponse>(body).lrc?.lyric
+        }.onFailure { Log.w(TAG, "lyric parse: ${it.message}") }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    /** 搜索（按歌名/歌手）。type=1 是单曲。 */
+    suspend fun search(keyword: String, limit: Int = 10): List<Track> =
+        withContext(Dispatchers.IO) {
+            if (keyword.isBlank()) return@withContext emptyList()
+            val body = get("$BASE/search/get/web?s=${enc(keyword)}&type=1&limit=$limit&offset=0")
+                ?: return@withContext emptyList()
+            runCatching {
+                NeteaseJson.instance.decodeFromString<NeSearchResponse>(body).result?.songs.orEmpty()
+                    .map { it.toTrack() }
+            }.onFailure { Log.w(TAG, "search parse: ${it.message}") }.getOrDefault(emptyList())
+        }
+
+    /** 统一把网易云 song 结构转成 app 的 [Track] */
+    private fun NeSong.toTrack() = Track(
+        id = "ne:$id",
+        name = name.orEmpty(),
+        artist = artists.orEmpty().joinToString("/") { it.name.orEmpty() },
+        album = album?.name.orEmpty(),
+        coverUrl = https(album?.picUrl),
+        durationMs = duration,
+        source = "netease",
+        sourceId = id.toString()
+    )
+
+    private fun enc(s: String): String =
+        java.net.URLEncoder.encode(s, "UTF-8")
 
     /** 网易云图片 http→https，避免明文流量被拦 */
     private fun https(u: String?): String? =

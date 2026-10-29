@@ -45,6 +45,7 @@ import com.kmusic.apkhd.net.WebDavClient
 import com.kmusic.apkhd.playback.DavAuth
 import com.kmusic.apkhd.net.LyricRepository
 import com.kmusic.apkhd.net.NavidromeClient
+import com.kmusic.apkhd.net.LyricQuery
 import com.kmusic.apkhd.net.NeteaseClient
 import com.kmusic.apkhd.net.TrackMatcher
 import com.kmusic.apkhd.net.PlaylistInfo
@@ -342,11 +343,27 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         return null
     }
 
-    /** 网易云直链（不换源）。GD 对无版权/VIP 会返回空串，这里统一按失败处理。 */
-    private suspend fun gdResolved(t: Track): Track? =
+    /**
+     * 网易云直链（不换源）。
+     *
+     * 顺序：gdstudio → 网易云直连。
+     *
+     * ⚠️ gdstudio 的 `types=url` 在 music.gdstudio.org 上已经 **401**
+     * （只剩 `types=playlist` 可用），所以实际生效的通常是第二条。
+     * 保留第一条是为了它哪天恢复时能自动用回「无损」档。
+     *
+     * 直连也有拿不到的：`code=-110` = 需 VIP/付费版权。这不是 bug，
+     * 上层会走换源（酷我/咪咕）。
+     */
+    private suspend fun gdResolved(t: Track): Track? {
         runCatching { gd.url(t.sourceId) }.getOrNull()
             ?.takeIf { it.isNotBlank() }
-            ?.let { t.copy(playUrl = it, qualityLabel = "无损") }
+            ?.let { return t.copy(playUrl = it, qualityLabel = "无损") }
+        val direct = runCatching { netease.playUrl(t.sourceId) }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+        return t.copy(playUrl = direct, qualityLabel = "320k")
+    }
 
     /** 咪咕直链（不换源） */
     private suspend fun miguResolved(t: Track): Track? =
@@ -361,7 +378,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun matchNetease(t: Track): Track? {
         val cands = runCatching {
-            withTimeout(8_000) { gd.search("${t.name} ${t.artist}", count = 10) }
+            withTimeout(8_000) {
+                netease.search("${t.name} ${t.artist}", limit = 10)
+                    .ifEmpty { gd.search("${t.name} ${t.artist}", count = 10) }
+            }
         }.getOrDefault(emptyList())
         val wantName = TrackMatcher.normalize(t.name)
         val hit = cands.firstOrNull {
@@ -370,6 +390,31 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         } ?: return null
         val resolved = gdResolved(hit) ?: return null
         return t.copy(playUrl = resolved.playUrl, qualityLabel = "无损")
+    }
+
+    /**
+     * 按名搜歌词（网易云直连）。
+     *
+     * 校验和 gdstudio/ lrclib 那条路同一套 [LyricQuery.verify] ——
+     * 宁可返回 null（显示「暂无歌词」），也不拿同名别人的版本冒充。
+     */
+    private suspend fun lyricByNameDirect(t: Track): String? {
+        if (t.name.isBlank()) return null
+        val cands = runCatching { netease.search("${t.name} ${t.artist}", limit = 10) }
+            .getOrDefault(emptyList())
+        var best: String? = null
+        var bestDist = Long.MAX_VALUE
+        for (c in cands) {
+            if (!LyricQuery.verify(c.name, c.artist, t.name, t.artist)) continue
+            val dist = kotlin.math.abs(c.durationMs - t.durationMs)
+            if (dist >= bestDist) continue
+            val text = runCatching { netease.lyric(c.sourceId) }.getOrNull() ?: continue
+            if (text.isNotBlank()) {
+                best = text
+                bestDist = dist
+            }
+        }
+        return best
     }
 
     /**
@@ -713,6 +758,14 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     var playlistDetail by mutableStateOf<PlaylistBrief?>(null)
         private set
     var playlistTracks by mutableStateOf<List<Track>>(emptyList())
+
+    /**
+     * 歌单被源截断（声明 200 首只给 10 首）时为 true。
+     *
+     * 以前这种情况是**静默**的：列表页写「200 首」，点进去 10 首，用户以为 app 坏了。
+     * 现在曲目列表底部会挂一行说明。
+     */
+    var playlistTruncated by mutableStateOf(false)
         private set
     var playlistLoading by mutableStateOf(false)
         private set
@@ -1118,7 +1171,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 // 网易云（gdstudio）：酷我没有的内容靠它补，播放时走母带优先/直链兜底
                 val neJob = async {
                     runCatching {
-                        withTimeout(perSourceTimeout) { gd.search(kw, count = 15) }
+                        withTimeout(perSourceTimeout) {
+                            // gd 的 types=search 在新域名上是 401，先试直连再回退 gd
+                            netease.search(kw, limit = 15).ifEmpty { gd.search(kw, count = 15) }
+                        }
                     }.getOrDefault(emptyList())
                 }
                 // 咪咕：官方接口、免登录 128k，用来补前两个源都没有的曲目
@@ -1415,19 +1471,33 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         playlistDetail = p
         playlistLoading = true
         playlistTracks = emptyList()
+        playlistTruncated = false
         viewModelScope.launch {
-            val loaded = runCatching {
-                if (p.source == "netease") {
-                    // 走 gdstudio 拿**完整**歌单。
-                    // ⚠️ 不要改回 netease.playlistTracks：music.163.com 的接口硬锁
-                    // tracks 到 10 首（实测见 GdStudioClient.playlistTracks 注释）。
-                    // 失败时兜底走官方接口，至少能拿到前 10 首。
-                    gd.playlistTracks(p.id).ifEmpty { netease.playlistTracks(p.id) }
-                } else {
-                    client.playlistSongs(p.id)
+            // 三级取数。顺序是有实测依据的，别随手调：
+            //   ① gdstudio  → 一次给全（1000 首以内），最快
+            //   ② 网易云直连 → v6 的 trackIds + song/detail 分批，无上限
+            //   ③ 官方 detail → 只给 10 首，**仅作最后兜底**，且要告诉用户
+            var loaded = emptyList<Track>()
+            var truncatedFrom = 0   // 声明数量；非 0 且 loaded 更少 = 源截断了
+            if (p.source == "netease") {
+                loaded = runCatching { gd.playlistTracks(p.id) }.getOrDefault(emptyList())
+                if (loaded.isEmpty()) {
+                    DiagLog.log("PLAYLIST_FETCH", "『${p.name}』gdstudio 空，改走网易云直连")
+                    loaded = runCatching { netease.fullPlaylistTracks(p.id) }
+                        .onFailure { DiagLog.log("PLAYLIST_FETCH", "直连失败：${it.message}") }
+                        .getOrDefault(emptyList())
                 }
-            }.getOrDefault(emptyList())
+                if (loaded.isEmpty()) {
+                    DiagLog.log("PLAYLIST_FETCH", "『${p.name}』直连也空，退回官方 detail（只有 10 首）")
+                    loaded = runCatching { netease.playlistTracks(p.id) }.getOrDefault(emptyList())
+                    truncatedFrom = p.trackCount
+                }
+            } else {
+                loaded = runCatching { client.playlistSongs(p.id) }.getOrDefault(emptyList())
+            }
             playlistTracks = loaded
+            // 只在「确实拿到东西、但明显少于声明」时提示；0 首走原来的空态文案
+            playlistTruncated = truncatedFrom > 0 && loaded.isNotEmpty() && loaded.size < truncatedFrom
 
             // 把**实际取到**的数量回写到所有同名歌单 brief 上。
             //
@@ -1464,6 +1534,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     fun closePlaylist() {
         playlistDetail = null
         playlistTracks = emptyList()
+        playlistTruncated = false
     }
 
     /** 打开歌手：酷我没有"歌手歌曲"接口，用歌手名走搜索（结果同样带 rid 可直接播） */
@@ -2437,12 +2508,15 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 val gdId = t.sourceId.removePrefix("ne:")
                 val g0 = System.currentTimeMillis()
                 // 这个接口正常 1~2s，卡住时不能拖住后面几十秒
+                // 先直连（新域名上 gd 的 types=lyric 是 401），拿不到再回退 gd
                 val raw = withTimeoutOrNull(6000) {
-                    runCatching { gd.lyric(gdId) }.getOrNull()
+                    runCatching { netease.lyric(gdId) }.getOrNull()
+                        ?.takeIf { it.isNotBlank() }
+                        ?: runCatching { gd.lyric(gdId) }.getOrNull()
                 }
                 DiagLog.log(
                     "LYRIC_GDSTUDIO",
-                    "gdstudio 取词 id=$gdId → " +
+                    "网易云/ gdstudio 取词 id=$gdId → " +
                         if (raw.isNullOrEmpty()) "空/失败" else "${raw.length} 字符",
                     System.currentTimeMillis() - g0
                 )
@@ -2467,8 +2541,12 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                         // 8s 硬超时：日语歌名在 gdstudio 上会一直磨到 40s+，
                         // 那一刻用户早就切歌了，等下去没有意义
                         val text = withTimeoutOrNull(5000) {
-                            runCatching { gd.lyricByName(t.name, t.artist, t.durationMs / 1000) }
-                                .getOrNull()
+                            // 按名搜歌词：先网易云直连（校验同样严格，看歌名+歌手+时长），
+                            // 拿不到再回退 gdstudio
+                            runCatching { lyricByNameDirect(t) }.getOrNull()
+                                ?: runCatching {
+                                    gd.lyricByName(t.name, t.artist, t.durationMs / 1000)
+                                }.getOrNull()
                         }
                         DiagLog.log(
                             "LYRIC_GDSTUDIO_BYNAME",

@@ -1,5 +1,18 @@
 # 更新日志
 
+## 2.3.7
+
+修两个 2.3.6 遗留问题：浅色主题圆角残缺、歌单「播放全部」只剩 10 首。
+
+- **浅色主题圆角：不是没做，是故意写了两套互相矛盾的值。** 浅色 `radiusCard` 只有 `6.wdp`（240dpi 下 3.6px，肉眼几乎看不出），而卡片内层封面写死 `14.wdp` —— **内圆角大于外圆角**，四角必然露方角底色。深色 `20.wdp` 恰好把这个矛盾盖住了，所以「深色正常」。改法：浅色 6 → **14.wdp**（保留比深色更方正的气质，但看得见）；新增 **`coverRadiusOf(c) = (radiusCard - 6.wdp).coerceAtLeast(2.wdp)`** 作为内层圆角唯一真源，四条调用点（排行榜卡 / 推荐歌单卡 / 继续播放卡 / 迷你播放条）全部改用它。规矩定死：**内层圆角永远不得大于外层容器**
+- **搜索框不再分两套代码。** 首页搜索框原来 `if (isDark)` 走玻璃描边、否则只画一条下划线（浅色完全没圆角）；搜索页浅色写 `2.wdp`。两处都改为统一走 `c.radiusCard`，浅色补 `clip` + `background` + `border`
+- **歌单只 10 首：根因是 gdstudio 域名挂了，回退到了限制最严的接口。** `GdStudioClient.API` 指向的 `music-api.gdstudio.xyz` 已返回 503/空数组，于是 `openPlaylist` 落到网易云官方 `/api/playlist/detail`——该接口对用户歌单**硬锁 `tracks` 到 10 首**（8 个真实推荐歌单 8/8 复现，即便声明 200/287/1000 首）。而 `music.gdstudio.org` 是好的（playlist 200/287/1000 首）
+- **只换域名，主路不动。** `.xyz` → `music.gdstudio.org`。它的 `types=url/search/pic/lyric` 四项是 401（前端签名 `crc32` 带时间盐，同一输入两次结果不同，本地复现不了），所以这四项改由 `music.163.com` 直连补：`song/enhance/player/url`、`song/lyric`、`search/get/web`、`song/detail.album.picUrl`。**是补位不是替代**
+- **取数三级兜底：** ① gdstudio → ② 网易云直连（`v6/playlist/detail` 的 `trackIds` 完整有序，再 `song/detail` 分批 200 取元数据，1268 首实测 1268/1268）→ ③ 官方 detail（只给 10 首，**仅最后兜底**）
+- **截断必须可见。** 落到官方 detail 时列表底部显示「这个歌单声明 N 首，但源只返回了 M 首」。以前是静默降级，用户只能看到 10 首却不知道原因
+- **取链顺序：** `gd.url()` → `netease.playUrl()` → 换源（酷我/咪咕）。VIP/付费曲直连返回 `code=-110`（`fee=1`），属版权限制，走换源
+- **歌词：** 直连优先 → gdstudio 兜底；按名搜词也改成先直连（仍过 `LyricQuery.verify`，宁可显示「暂无歌词」也不拿同名别人的版本冒充）
+
 ## 2.3.6
 
 修 2.3.5 的一个致命 bug：开音效就是一片杂音。DSP 本身没问题，是我把差分方程的系数用反了。

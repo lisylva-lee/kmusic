@@ -28,7 +28,19 @@ class GdStudioClient {
 
     companion object {
         private const val TAG = "GdStudioClient"
-        private const val API = "https://music-api.gdstudio.xyz/api.php"
+        /**
+         * ⚠️ 域名别改回 music-api.gdstudio.xyz —— 那台已经挂了：
+         * 返回 503，或者返回 200 但 body 是 `[]` / 空 url（静默失败，最难查）。
+         *
+         * 2026-10 实测现状：
+         * - music.gdstudio.org/api.php?types=playlist  ✅ 完整（200 首全给，
+         *   287 首的歌单给 287 首，1000 是它的单次上限）
+         * - 同一个域名 types=url / search / pic / lyric → **401**
+         *
+         * 所以这里只承担「取歌单」，取链/搜索/歌词/封面一律走 [NeteaseClient] 直连。
+         * 别把 url/search 再挂回来 —— 会 401。
+         */
+        private const val API = "https://music.gdstudio.org/api.php"
 
         /** 音质档位：999=flac24bit / 740=flac / 320 / 128 */
         const val BR_FLAC24 = 999

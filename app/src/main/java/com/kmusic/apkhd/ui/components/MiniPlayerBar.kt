@@ -18,6 +18,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kmusic.apkhd.ui.icons.IconPause
 import com.kmusic.apkhd.ui.icons.IconPlay
+import com.kmusic.apkhd.ui.theme.coverRadiusOf
 import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
@@ -60,7 +61,8 @@ fun MiniPlayerBar(
             .padding(horizontal = 10.wdp, vertical = 8.wdp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        CoverArt(coverUrl = coverUrl, modifier = Modifier.size(44.wdp), cornerRadius = 8.wdp)
+        // 内层永远比外层小 6dp，避免「内圆角大于外圆角」露方角
+        CoverArt(coverUrl = coverUrl, modifier = Modifier.size(44.wdp), cornerRadius = coverRadiusOf(c))
         Spacer(Modifier.width(12.wdp))
         Column(Modifier.weight(1f)) {
             Text(

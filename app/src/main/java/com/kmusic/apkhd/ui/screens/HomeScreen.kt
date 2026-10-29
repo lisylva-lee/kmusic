@@ -39,6 +39,7 @@ import com.kmusic.apkhd.ui.theme.ambientAlpha
 import com.kmusic.apkhd.ui.theme.ambientGlow
 import com.kmusic.apkhd.ui.theme.cardGradient
 import com.kmusic.apkhd.ui.theme.cardHighlightGradient
+import com.kmusic.apkhd.ui.theme.coverRadiusOf
 import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.window
 import com.kmusic.apkhd.ui.theme.wdp
@@ -117,23 +118,26 @@ fun HomeScreen(
 
                 // 搜索入口（点击跳到搜索页）
                 Column {
+                    // 两套主题都必须有形状和边界。曾经浅色只画一条下划线，
+                    // 结果是「深色有胶囊、浅色什么都没有」—— 看起来像圆角没做。
+                    // 浅色改成同半径的实底 + 细线：纸感靠线，但形状必须和深色一致。
+                    val searchShape = RoundedCornerShape(c.radiusCard)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(44.wdp)
-                            .then(
-                                // 深色：玻璃胶囊；浅色：只有一条下划线（纸感的呼吸感）
-                                if (c.isDark) Modifier
-                                    .clip(RoundedCornerShape(c.radiusCard))
-                                    .background(c.glass)
-                                    .border(1.wdp, c.glassBorder, RoundedCornerShape(c.radiusCard))
-                                else Modifier
+                            .clip(searchShape)
+                            .background(if (c.isDark) c.glass else c.s2)
+                            .border(
+                                width = 1.wdp,
+                                color = if (c.isDark) c.glassBorder else c.lineStrong.copy(alpha = 0.22f),
+                                shape = searchShape
                             )
                             .clickable(
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
                             ) { onSearchClick() }
-                            .padding(horizontal = if (c.isDark) 14.wdp else 0.wdp),
+                            .padding(horizontal = 14.wdp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         MoyinIcon(icon = IconSearch, tint = c.t3, size = 18.wdp)
@@ -143,14 +147,6 @@ fun HomeScreen(
                             color = c.t3,
                             fontSize = 14.wsp,
                             letterSpacing = if (c.titleSerif) 0.4.sp else 0.sp
-                        )
-                    }
-                    if (!c.isDark) {
-                        Box(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(1.dp)
-                                .background(c.lineStrong.copy(alpha = 0.22f))
                         )
                     }
                 }
@@ -354,7 +350,7 @@ private fun ContinueCard(
         CoverArt(
             coverUrl = track.coverUrl,
             modifier = Modifier.size(54.wdp),
-            cornerRadius = if (c.titleSerif) 2.wdp else 10.wdp
+            cornerRadius = coverRadiusOf(c)
         )
         Spacer(Modifier.width(12.wdp))
         Column(Modifier.weight(1f)) {
@@ -586,7 +582,7 @@ private fun ChartCard(section: ChartSection, onClick: () -> Unit) {
                 CoverArt(
                     coverUrl = section.chart.coverUrl,
                     modifier = Modifier.fillMaxSize(),
-                    cornerRadius = 14.wdp
+                    cornerRadius = coverRadiusOf(c)
                 )
             }
         }
@@ -639,7 +635,7 @@ private fun PlaylistCard(
                 CoverArt(
                     coverUrl = playlist.coverUrl,
                     modifier = Modifier.fillMaxSize(),
-                    cornerRadius = 14.wdp
+                    cornerRadius = coverRadiusOf(c)
                 )
             }
             // 收藏角标：压在封面右下角，半透明黑底保证在任何封面图上都看得清

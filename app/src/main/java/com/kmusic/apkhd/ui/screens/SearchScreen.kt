@@ -139,11 +139,13 @@ fun SearchScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(44.wdp)
+                // 半径跟卡片同源（c.radiusCard）。以前深色写 14、浅色写 2，
+                // 同一个控件在首页是 14、在搜索页是 2 —— 两套数字必然漂移。
                 .frosted(
-                    shape = RoundedCornerShape(if (c.isDark) 14.wdp else 2.wdp),
+                    shape = RoundedCornerShape(c.radiusCard),
                     alpha = if (c.isDark) 0.88f else 0.92f
                 )
-                .padding(horizontal = if (c.isDark) 14.wdp else 12.wdp),
+                .padding(horizontal = 12.wdp),
             verticalAlignment = Alignment.CenterVertically
         ) {
                 MoyinIcon(icon = IconSearch, tint = c.t3, size = 18.wdp)
@@ -172,7 +174,7 @@ fun SearchScreen(
                     Spacer(Modifier.width(8.wdp))
                     Box(
                         Modifier
-                            .clip(RoundedCornerShape(if (c.isDark) 8.wdp else 2.wdp))
+                            .clip(RoundedCornerShape((c.radiusCard - 6.wdp).coerceAtLeast(2.wdp)))
                             .background(if (aiRewriting) c.accentDim else c.s3)
                             .clickable(
                                 indication = null,

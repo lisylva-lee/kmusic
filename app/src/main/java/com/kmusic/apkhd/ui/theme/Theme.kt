@@ -173,8 +173,17 @@ data class MoyinColors(
     val glassBorder: Color,
     /** B 套的可见分割线（比 line 重，纸感靠它撑） */
     val lineStrong: Color,
-    /** 卡片圆角：A 圆润 20dp，B 近乎直角 6dp */
+    /**
+     * 卡片圆角：A 圆润 20dp，B 方正但看得见 14dp。
+     *
+     * ⚠️ 浅色原来给的 6dp 是设计稿上的「近乎直角」，但 240dpi 下只有 3.6px，
+     * 配上内层写死的 14dp 封面圆角就成了「外层没圆角、内层却有」，看起来
+     * 像圆角没处理。改 14dp：仍然比深色方正（20 vs 14），但和封面能对齐。
+     *
+     * 任何内层元素的圆角都**不得大于**它所在的卡片，见 [coverRadius]。
+     */
     val radiusCard: Dp,
+
     /** 大标题字体：A 无衬线，B 衬线 */
     val titleSerif: Boolean,
     /** 列表编号色：A 灰，B 砖红 */
@@ -228,7 +237,7 @@ fun ProvideMoyinColors(
         MoyinColors(false, LightBg, LightS1, LightS2, LightS3, LightS4, LightLine, LightT1, LightT2, LightT3,
             LightAccent, LightAccentDim, LightAccentLine, LightOnAccent, CoverGradLight,
             glass = Color(0xA6FDFCF9), glassBorder = Color(0xFFD5CEBC),
-            lineStrong = Color(0xFF15140F), radiusCard = 6.wdp,
+            lineStrong = Color(0xFF15140F), radiusCard = 14.wdp,
             titleSerif = true, numeral = LightAccent)
     }
 
@@ -329,3 +338,14 @@ val MoyinColors.cardHighlightGradient: List<Color>
 /** 顶部氛围光强度：深色更明显，浅色只留一层极淡的色雾 */
 val MoyinColors.ambientAlpha: Float
     get() = if (isDark) 0.18f else 0.07f
+
+/**
+ * 卡片内层封面圆角 —— 唯一真源。
+ *
+ * 规则：永远比外层容器小 6dp。以前各卡片把内层写成固定 14.wdp，
+ * 而浅色容器的 radiusCard 只有 6dp —— 内圆角大于外圆角，四角露出方角底色，
+ * 看起来就是「浅色圆角没处理」。
+ */
+@androidx.compose.runtime.Composable
+fun coverRadiusOf(c: MoyinColors): androidx.compose.ui.unit.Dp =
+    (c.radiusCard - 6.wdp).coerceAtLeast(2.wdp)
